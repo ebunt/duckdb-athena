@@ -1,0 +1,26 @@
+[package]
+name = "duckdb-athena"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+quack-rs = "0.11"
+libduckdb-sys = { version = ">=1.4.4, <2", features = ["loadable-extension"] }
+tokio = { version = "1", features = ["full"] }
+aws-config = "1"
+aws-sdk-athena = "1"
+aws-sdk-glue = "1"
+lazy_static = "1"
+anyhow = { version = "1", features = ["backtrace"] }
+futures = "0.3"
+
+[lib]
+name = "duckdb_athena"
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
