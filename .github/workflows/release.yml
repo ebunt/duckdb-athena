@@ -2,9 +2,15 @@ name: Release
 
 on:
   pull_request:
+    paths:
+      - 'src/**'
+      - 'scripts/**'
   push:
     branches: [main]
     tags: ["v*"]
+    paths:
+      - 'src/**'
+      - 'scripts/**'
   workflow_dispatch:
 
 concurrency:

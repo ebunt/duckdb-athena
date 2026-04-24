@@ -112,9 +112,11 @@ SELECT COUNT(*) FROM athena_scan('my_table', 's3://my-results-bucket/prefix/');
 Query progress is printed to the console:
 
 ```
-Running Athena query, execution id: 152a20c7-ff32-4a19-bb71-ae0135373ca6
-State: Running, sleeping 5 secs...
-Total execution time: 1307 millis
+Running Athena query, execution id: 04d0e6b9-5947-457a-9053-cbd9042d2b80
+State: Queued, sleeping 5 secs...
+Time in queue: 100 ms
+Run time: 777 ms
+Data scanned: 10.92 MB
 ```
 
 ## Limitations
