@@ -6,6 +6,7 @@ use quack_rs::error::ExtensionError;
 use tokio::runtime::Runtime;
 
 pub mod error;
+mod query;
 mod table_function;
 mod types;
 

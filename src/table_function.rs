@@ -18,6 +18,7 @@ use quack_rs::{
 use std::{ffi::CString, thread};
 use tokio::time::Duration;
 
+use crate::query::{build_athena_query, validate_predicate, SelectList};
 use crate::types::{map_type, populate_column};
 
 const DEFAULT_LIMIT: i32 = 10000;
@@ -26,6 +27,10 @@ const DEFAULT_WORKGROUP: &str = "primary";
 #[derive(Clone)]
 struct ColumnSchema {
     name: String,
+    duckdb_type: TypeId,
+    glue_type: String,
+    ordinal: usize,
+    is_partition: bool,
 }
 
 struct ScanBindData {
@@ -246,95 +251,6 @@ fn format_bytes(bytes: i64) -> String {
     }
 }
 
-fn quote_identifier(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
-}
-
-fn qualified_table(database: &str, tablename: &str) -> String {
-    format!(
-        "{}.{}",
-        quote_identifier(database),
-        quote_identifier(tablename)
-    )
-}
-
-fn validate_predicate(predicate: &str) -> anyhow::Result<String> {
-    let predicate = predicate.trim();
-    if predicate.is_empty() {
-        anyhow::bail!("predicate must not be empty");
-    }
-    if predicate.contains('\0') {
-        anyhow::bail!("predicate must not contain NUL bytes");
-    }
-    if predicate.contains(';') {
-        anyhow::bail!("predicate must be a single WHERE expression without semicolons");
-    }
-    if predicate.contains("--") || predicate.contains("/*") || predicate.contains("*/") {
-        anyhow::bail!("predicate must not contain SQL comments");
-    }
-
-    let uppercase = predicate.to_ascii_uppercase();
-    for keyword in [
-        " SELECT ",
-        " INSERT ",
-        " UPDATE ",
-        " DELETE ",
-        " CREATE ",
-        " DROP ",
-        " ALTER ",
-        " TRUNCATE ",
-        " UNLOAD ",
-        " MSCK ",
-        " REPAIR ",
-    ] {
-        if format!(" {uppercase} ").contains(keyword) {
-            anyhow::bail!("predicate must be a WHERE expression, not a full SQL statement");
-        }
-    }
-
-    Ok(predicate.to_owned())
-}
-
-enum SelectList {
-    All,
-    RowsOnly,
-    Columns(Vec<String>),
-}
-
-fn render_select_list(select: &SelectList) -> String {
-    match select {
-        SelectList::All => "*".to_owned(),
-        SelectList::RowsOnly => "1".to_owned(),
-        SelectList::Columns(columns) => columns
-            .iter()
-            .map(|column| quote_identifier(column))
-            .collect::<Vec<_>>()
-            .join(", "),
-    }
-}
-
-fn build_athena_query(
-    database: &str,
-    tablename: &str,
-    select: &SelectList,
-    predicate: Option<&str>,
-    maxrows: i32,
-) -> String {
-    let mut query = format!(
-        "SELECT {} FROM {}",
-        render_select_list(select),
-        qualified_table(database, tablename)
-    );
-    if let Some(predicate) = predicate {
-        query.push_str(" WHERE ");
-        query.push_str(predicate);
-    }
-    if maxrows > 0 {
-        query.push_str(&format!(" LIMIT {maxrows}"));
-    }
-    query
-}
-
 fn projected_select_list(init_info: &InitInfo, columns: &[ColumnSchema]) -> SelectList {
     let projected_count = init_info.projected_column_count();
     if projected_count == columns.len() {
@@ -350,6 +266,32 @@ fn projected_select_list(init_info: &InitInfo, columns: &[ColumnSchema]) -> Sele
         .collect();
 
     SelectList::Columns(selected)
+}
+
+fn debug_assert_column_metadata(columns: &[ColumnSchema]) {
+    debug_assert!(columns
+        .iter()
+        .enumerate()
+        .all(|(ordinal, column)| column.ordinal == ordinal
+            && !column.name.is_empty()
+            && !column.glue_type.is_empty()
+            && matches!(
+                column.duckdb_type,
+                TypeId::Boolean
+                    | TypeId::TinyInt
+                    | TypeId::SmallInt
+                    | TypeId::Integer
+                    | TypeId::BigInt
+                    | TypeId::Float
+                    | TypeId::Double
+                    | TypeId::Varchar
+            )));
+
+    if let Some(first_partition) = columns.iter().position(|column| column.is_partition) {
+        debug_assert!(columns[first_partition..]
+            .iter()
+            .all(|column| column.is_partition));
+    }
 }
 
 /// # Safety
@@ -436,10 +378,14 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
                     if let Some(sd) = table.storage_descriptor() {
                         for column in sd.columns() {
                             let type_str = column.r#type().unwrap_or("varchar").to_string();
-                            let type_id = map_type(type_str).unwrap_or(TypeId::Varchar);
+                            let type_id = map_type(type_str.clone()).unwrap_or(TypeId::Varchar);
                             bi.add_result_column(column.name(), type_id);
                             columns.push(ColumnSchema {
                                 name: column.name().to_owned(),
+                                duckdb_type: type_id,
+                                glue_type: type_str,
+                                ordinal: columns.len(),
+                                is_partition: false,
                             });
                         }
                     }
@@ -447,10 +393,14 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
                     // Registering them here keeps the DuckDB chunk column count in sync.
                     for column in table.partition_keys() {
                         let type_str = column.r#type().unwrap_or("varchar").to_string();
-                        let type_id = map_type(type_str).unwrap_or(TypeId::Varchar);
+                        let type_id = map_type(type_str.clone()).unwrap_or(TypeId::Varchar);
                         bi.add_result_column(column.name(), type_id);
                         columns.push(ColumnSchema {
                             name: column.name().to_owned(),
+                            duckdb_type: type_id,
+                            glue_type: type_str,
+                            ordinal: columns.len(),
+                            is_partition: true,
                         });
                     }
                 }
@@ -458,6 +408,7 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
                     bi.set_error("Glue table has no supported columns");
                     return;
                 }
+                debug_assert_column_metadata(&columns);
                 let limit = if maxrows > 0 { maxrows } else { DEFAULT_LIMIT };
                 FfiBindData::<ScanBindData>::set(
                     bind_info,
@@ -599,92 +550,4 @@ pub fn build_table_function_def() -> TableFunctionBuilder {
         .bind(read_athena_bind)
         .init(read_athena_init)
         .scan(read_athena)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{build_athena_query, qualified_table, validate_predicate, SelectList};
-
-    #[test]
-    fn qualified_table_quotes_identifiers() {
-        assert_eq!(
-            qualified_table("analytics", "events"),
-            "\"analytics\".\"events\""
-        );
-        assert_eq!(
-            qualified_table("odd\"db", "odd\"table"),
-            "\"odd\"\"db\".\"odd\"\"table\""
-        );
-    }
-
-    #[test]
-    fn build_query_includes_predicate_before_limit() {
-        assert_eq!(
-            build_athena_query(
-                "analytics",
-                "events",
-                &SelectList::All,
-                Some("year = 2024"),
-                100
-            ),
-            "SELECT * FROM \"analytics\".\"events\" WHERE year = 2024 LIMIT 100"
-        );
-    }
-
-    #[test]
-    fn build_query_omits_limit_for_non_positive_limit() {
-        assert_eq!(
-            build_athena_query(
-                "analytics",
-                "events",
-                &SelectList::All,
-                Some("year = 2024"),
-                0
-            ),
-            "SELECT * FROM \"analytics\".\"events\" WHERE year = 2024"
-        );
-    }
-
-    #[test]
-    fn build_query_supports_projection() {
-        assert_eq!(
-            build_athena_query(
-                "analytics",
-                "events",
-                &SelectList::Columns(vec!["event_type".to_owned(), "odd\"col".to_owned()]),
-                None,
-                10,
-            ),
-            "SELECT \"event_type\", \"odd\"\"col\" FROM \"analytics\".\"events\" LIMIT 10"
-        );
-    }
-
-    #[test]
-    fn build_query_supports_rows_only_projection() {
-        assert_eq!(
-            build_athena_query("analytics", "events", &SelectList::RowsOnly, None, 10),
-            "SELECT 1 FROM \"analytics\".\"events\" LIMIT 10"
-        );
-    }
-
-    #[test]
-    fn validate_predicate_accepts_simple_where_expression() {
-        assert_eq!(
-            validate_predicate(" year = 2024 AND event_type = 'click' ").unwrap(),
-            "year = 2024 AND event_type = 'click'"
-        );
-    }
-
-    #[test]
-    fn validate_predicate_rejects_statement_separators_and_comments() {
-        assert!(validate_predicate("year = 2024; DROP TABLE events").is_err());
-        assert!(validate_predicate("year = 2024 -- comment").is_err());
-        assert!(validate_predicate("year = 2024 /* comment */").is_err());
-    }
-
-    #[test]
-    fn validate_predicate_rejects_full_sql_statements() {
-        assert!(validate_predicate("SELECT * FROM events").is_err());
-        assert!(validate_predicate("year = 2024 DELETE FROM events").is_err());
-    }
 }
