@@ -1,14 +1,20 @@
 # DuckDB Athena Extension
 
-> **Work in progress** — things may not work as expected
+Work-in-progress DuckDB extension for querying Amazon Athena tables with `athena_scan`.
 
-Query Amazon Athena tables directly from DuckDB using `athena_scan`.
+## Requirements
 
-## Prerequisites
-
-- Rust stable toolchain (`rustup install stable`)
+- Rust stable
 - DuckDB CLI v1.5+
-- AWS credentials with access to Athena, Glue, and S3
+- AWS credentials with Athena, Glue, and S3 access
+
+Required IAM actions:
+- `athena:StartQueryExecution`
+- `athena:GetQueryExecution`
+- `athena:GetQueryResults`
+- `glue:GetTable`
+- `s3:PutObject`
+- `s3:GetObject`
 
 ## Build
 
@@ -16,40 +22,9 @@ Query Amazon Athena tables directly from DuckDB using `athena_scan`.
 make
 ```
 
-This compiles the extension and places it at `target/release/duckdb_athena.duckdb_extension`.
-
-## AWS credentials
-
-Set standard AWS environment variables, or use any credential source the AWS SDK supports (instance profile, SSO, `~/.aws/credentials`):
-
-```bash
-export AWS_ACCESS_KEY_ID=...
-export AWS_SECRET_ACCESS_KEY=...
-export AWS_REGION=us-east-1
-```
-
-Required IAM permissions:
-- `athena:StartQueryExecution`, `athena:GetQueryExecution`, `athena:GetQueryResults`
-- `glue:GetTable` on the target table
-- `s3:PutObject`, `s3:GetObject` on the S3 results bucket
+This builds `target/release/duckdb_athena.duckdb_extension` using the Rust packager in `src/bin/package_extension.rs`.
 
 ## Load
-
-Start DuckDB with the `-unsigned` flag (required because the extension is locally compiled without a release signature):
-
-```bash
-duckdb -unsigned
-```
-
-Then load the extension:
-
-```sql
-LOAD 'target/release/duckdb_athena.duckdb_extension';
-```
-
--OR-
-
-In one statement:
 
 ```bash
 duckdb -unsigned -cmd "LOAD 'target/release/duckdb_athena.duckdb_extension';"
@@ -57,71 +32,66 @@ duckdb -unsigned -cmd "LOAD 'target/release/duckdb_athena.duckdb_extension';"
 
 ## Usage
 
-### Basic scan
-
-Provide the Glue table name and an S3 output location for Athena results:
-
 ```sql
-SELECT * FROM athena_scan('my_table', 's3://my-results-bucket/prefix/');
+SELECT *
+FROM athena_scan('my_table', 's3://my-results-bucket/prefix/');
 ```
 
-### Specify a Glue database
+Options:
+- `database`: Glue database, default `default`.
+- `workgroup`: Athena workgroup, default `primary`.
+- `maxrows`: Athena `LIMIT`, default `10000`; pass `-1` to disable.
+- `predicate`: trusted raw Athena SQL `WHERE` expression for manual pushdown.
+- `verbose`: print Athena status and scan stats, default `false`.
 
-Defaults to the `default` database. Pass `database=` to override:
-
-```sql
-SELECT * FROM athena_scan('my_table', 's3://my-results-bucket/prefix/', database='my_database');
-```
-
-### Return all rows
-
-The default limit is 10,000 rows. Pass `maxrows=-1` to remove it:
-
-```sql
-SELECT * FROM athena_scan('my_table', 's3://my-results-bucket/prefix/', maxrows=-1);
-```
-
-### Filter results
-
-DuckDB `WHERE` clauses are not pushed down automatically yet. For the MVP, pass an Athena SQL predicate with `predicate=` to add a `WHERE` clause to the query submitted to Athena:
+Examples:
 
 ```sql
 SELECT *
 FROM athena_scan(
   'my_table',
   's3://my-results-bucket/prefix/',
-  database='my_database',
-  predicate='year = 2024'
+  database='analytics',
+  workgroup='analytics',
+  predicate='year = 2024',
+  maxrows=1000
 );
 ```
 
-You can still use a normal DuckDB `WHERE` clause for local filtering after Athena returns results:
-
 ```sql
-SELECT *
-FROM athena_scan('my_table', 's3://my-results-bucket/prefix/', predicate='year = 2024')
-WHERE event_type = 'click';
+SELECT COUNT(*)
+FROM athena_scan('my_table', 's3://my-results-bucket/prefix/');
 ```
 
-### Count rows
+DuckDB projection pushdown is enabled, so selecting fewer columns submits a narrower Athena `SELECT` list. Normal DuckDB `WHERE` clauses are still evaluated locally unless passed through `predicate`.
 
-```sql
-SELECT COUNT(*) FROM athena_scan('my_table', 's3://my-results-bucket/prefix/');
+## Tests
+
+```bash
+cargo fmt --check
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Query progress is printed to the console:
+AWS integration tests are opt-in:
 
+```bash
+make
+export ATHENA_TEST_DATABASE=my_database
+export ATHENA_TEST_TABLE=my_table
+export ATHENA_TEST_OUTPUT=s3://my-results-bucket/prefix/
+cargo test --test aws_integration
 ```
-Running Athena query, execution id: 04d0e6b9-5947-457a-9053-cbd9042d2b80
-State: Queued, sleeping 5 secs...
-Time in queue: 100 ms
-Run time: 777 ms
-Data scanned: 10.92 MB
-```
+
+Optional integration variables:
+- `ATHENA_TEST_WORKGROUP`
+- `ATHENA_TEST_PROJECTION_COLUMN`
+- `ATHENA_TEST_PREDICATE`
+- `ATHENA_TEST_PAGINATION_ROWS`
+- `ATHENA_EXTENSION_PATH`
 
 ## Limitations
 
-- Not all Athena data types are supported (complex types: array, map, struct)
-- Automatic DuckDB filter pushdown is not implemented; use `predicate=` for manual Athena-side filtering
-- Defaults to 10,000 rows (`maxrows=-1` to disable)
-- Workgroup is hardcoded to `primary`
+- Complex Athena types such as `array`, `map`, and `struct` are not supported.
+- `predicate` is raw Athena SQL for trusted callers, not a full SQL parser.
+- Automatic DuckDB filter pushdown is not implemented.

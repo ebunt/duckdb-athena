@@ -1,17 +1,8 @@
 name: Release
 
 on:
-    pull_request:
-        paths:
-            - 'src/**'
-            - 'scripts/**'
     push:
-        branches: [main]
         tags: ["v*"]
-        paths:
-            - 'src/**'
-            - 'scripts/**'
-    workflow_dispatch:
 
 concurrency:
     group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}
@@ -36,6 +27,9 @@ jobs:
 
             - name: Check formatting
               run: cargo fmt --check
+
+            - name: Run Clippy
+              run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
             - name: Run tests
               run: cargo test --locked
@@ -90,9 +84,19 @@ jobs:
                   if [[ -z "${RELEASE_VERSION}" ]]; then
                     RELEASE_VERSION="$(git rev-parse --short=12 HEAD)"
                   fi
-                  cp "target/${{ matrix.target }}/release/${{ matrix.library }}" "dist/athena.duckdb_extension"
-                  DUCKDB_EXTENSION_VERSION="${RELEASE_VERSION}" python scripts/append_extension_footer.py "dist/athena.duckdb_extension"
+                  DUCKDB_EXTENSION_VERSION="${RELEASE_VERSION}" \
+                    cargo run --release --locked --bin package_extension -- \
+                    "target/${{ matrix.target }}/release/${{ matrix.library }}" \
+                    "dist/athena.duckdb_extension"
                   gzip -9 -c "dist/athena.duckdb_extension" > "dist/athena-${{ matrix.platform }}.duckdb_extension.gz"
+
+            - name: Install DuckDB CLI
+              if: ${{ matrix.platform == 'osx_arm64' }}
+              run: brew install duckdb
+
+            - name: Smoke test extension load
+              if: ${{ matrix.platform == 'osx_arm64' }}
+              run: duckdb -unsigned -c "LOAD 'dist/athena.duckdb_extension';"
 
             - name: Upload build artifact
               uses: actions/upload-artifact@v7

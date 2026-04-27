@@ -24,9 +24,7 @@ all: build
 
 build:
 	cargo build --release
-	cp $(BUILT_LIB) $(EXTENSION)
-	python3 scripts/append_extension_footer.py $(EXTENSION)
-	@echo "Extension ready: $(EXTENSION)"
+	cargo run --release --bin package_extension -- $(BUILT_LIB) $(EXTENSION)
 
 clean:
 	cargo clean
