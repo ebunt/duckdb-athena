@@ -59,10 +59,22 @@ duckdb -unsigned -cmd "LOAD 'target/release/duckdb_athena.duckdb_extension';"
 
 ### Basic scan
 
-Provide the Glue table name and an S3 output location for Athena results:
+If your Athena workgroup has an output location configured, only the table name is required:
 
 ```sql
-SELECT * FROM athena_scan('my_table', 's3://my-results-bucket/prefix/');
+SELECT * FROM athena_scan('my_table');
+```
+
+Pass `workgroup=` to use a specific workgroup (defaults to `primary`):
+
+```sql
+SELECT * FROM athena_scan('my_table', workgroup='my_workgroup');
+```
+
+Or provide an explicit S3 output location with `output_location=`:
+
+```sql
+SELECT * FROM athena_scan('my_table', output_location='s3://my-results-bucket/prefix/');
 ```
 
 ### Specify a Glue database
@@ -70,7 +82,7 @@ SELECT * FROM athena_scan('my_table', 's3://my-results-bucket/prefix/');
 Defaults to the `default` database. Pass `database=` to override:
 
 ```sql
-SELECT * FROM athena_scan('my_table', 's3://my-results-bucket/prefix/', database='my_database');
+SELECT * FROM athena_scan('my_table', workgroup='my_workgroup', database='my_database');
 ```
 
 ### Return all rows
@@ -95,9 +107,20 @@ DuckDB `WHERE` clauses are not pushed down automatically yet. For the MVP, pass 
 SELECT *
 FROM athena_scan(
   'my_table',
-  's3://my-results-bucket/prefix/',
+  workgroup='my_workgroup',
   database='my_database',
-  predicate='year = 2024'
+  predicate=$$year = 2024$$
+);
+```
+
+Use DuckDB's `$$` dollar-quoting to avoid escaping quotes:
+
+```sql
+SELECT *
+FROM athena_scan(
+  'my_table',
+  workgroup='my_workgroup',
+  predicate=$$mon = '12' AND event_type = 'click'$$
 );
 ```
 
@@ -105,14 +128,14 @@ You can still use a normal DuckDB `WHERE` clause for local filtering after Athen
 
 ```sql
 SELECT *
-FROM athena_scan('my_table', 's3://my-results-bucket/prefix/', predicate='year = 2024')
+FROM athena_scan('my_table', workgroup='my_workgroup', predicate=$$year = 2024$$)
 WHERE event_type = 'click';
 ```
 
 ### Count rows
 
 ```sql
-SELECT COUNT(*) FROM athena_scan('my_table', 's3://my-results-bucket/prefix/');
+SELECT COUNT(*) FROM athena_scan('my_table');
 ```
 
 Query progress is printed to the console:
@@ -130,4 +153,4 @@ Data scanned: 10.92 MB
 - Not all Athena data types are supported (complex types: array, map, struct)
 - Automatic DuckDB filter pushdown is not implemented; use `predicate=` for manual Athena-side filtering
 - Defaults to 10,000 rows (`maxrows=-1` to disable, `maxrows=N` for a custom limit)
-- Workgroup is hardcoded to `primary`
+- Workgroup defaults to `primary`; pass `workgroup=` to override
