@@ -81,6 +81,12 @@ The default limit is 10,000 rows. Pass `maxrows=-1` to remove it:
 SELECT * FROM athena_scan('my_table', 's3://my-results-bucket/prefix/', maxrows=-1);
 ```
 
+Or pass a positive integer to use a custom limit:
+
+```sql
+SELECT * FROM athena_scan('my_table', 's3://my-results-bucket/prefix/', maxrows=50000);
+```
+
 ### Filter results
 
 DuckDB `WHERE` clauses are not pushed down automatically yet. For the MVP, pass an Athena SQL predicate with `predicate=` to add a `WHERE` clause to the query submitted to Athena:
@@ -123,5 +129,5 @@ Data scanned: 10.92 MB
 
 - Not all Athena data types are supported (complex types: array, map, struct)
 - Automatic DuckDB filter pushdown is not implemented; use `predicate=` for manual Athena-side filtering
-- Defaults to 10,000 rows (`maxrows=-1` to disable)
+- Defaults to 10,000 rows (`maxrows=-1` to disable, `maxrows=N` for a custom limit)
 - Workgroup is hardcoded to `primary`

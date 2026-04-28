@@ -343,7 +343,7 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
             }
         }
 
-        let limit = if maxrows > 0 { maxrows } else { DEFAULT_LIMIT };
+        let limit = if maxrows == 0 { DEFAULT_LIMIT } else { maxrows };
         FfiBindData::<ScanBindData>::set(
             bind_info,
             ScanBindData::new(&tablename, &database, &output_location, limit, predicate),
