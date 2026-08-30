@@ -9,7 +9,8 @@ near one byte chunk. `GetQueryResults` paging (1000 rows per call) remains only
 as the fallback for executions exposing no S3 location, e.g. Athena-managed
 query results. Column projection is pushed into Athena; filtering with
 `predicate=` is manual, and a plain DuckDB `WHERE` runs locally after rows
-return.
+return. A `predicate=` is checked at bind: no statement separators, comments or
+statement keywords, and every column it names must exist in the Glue schema.
 
 ## Blocked
 
@@ -30,10 +31,14 @@ return.
   results) and native `DATE`/`TIMESTAMP`/`DECIMAL` columns (needs a table that
   has them).
 
-## Open review finding
+## Unverified assumptions
 
-- **Validate predicate column references** against the bind-time schema instead
-  of accepting any raw expression (carryover MVP hardening).
+- **One result object per query.** `open_result_csv` reads a single S3 object,
+  the execution's `ResultConfiguration.OutputLocation`. Athena writes ordinary
+  `SELECT` results as one CSV, verified up to 1.07M rows / 4.2 MB, but nothing
+  checks it: if a result were ever split across objects the scan would return a
+  prefix and report success. Hardening options are to compare rows read against
+  the execution statistics, or to list the prefix instead of assuming the key.
 
 ## Predicate translation design (for the C++ API path)
 

@@ -359,6 +359,148 @@ fn validate_predicate(predicate: &str) -> Result<String, String> {
     Ok(predicate.to_owned())
 }
 
+/// Words that can appear bare in a `WHERE` expression without naming a column:
+/// operators, literals, and the type names used by casts and typed literals.
+/// Deliberately permissive — a word listed here is simply not checked, so the
+/// worst case is that a mistyped column slips through to Athena, which is where
+/// it would have been caught before this validation existed.
+const PREDICATE_WORDS: &[&str] = &[
+    "AND",
+    "OR",
+    "NOT",
+    "IN",
+    "IS",
+    "NULL",
+    "LIKE",
+    "BETWEEN",
+    "TRUE",
+    "FALSE",
+    "ESCAPE",
+    "CAST",
+    "AS",
+    "DISTINCT",
+    "ALL",
+    "ANY",
+    "SOME",
+    "EXISTS",
+    "CASE",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "END",
+    "DATE",
+    "TIME",
+    "TIMESTAMP",
+    "INTERVAL",
+    "ZONE",
+    "YEAR",
+    "MONTH",
+    "DAY",
+    "HOUR",
+    "MINUTE",
+    "SECOND",
+    "VARCHAR",
+    "CHAR",
+    "BOOLEAN",
+    "TINYINT",
+    "SMALLINT",
+    "INTEGER",
+    "INT",
+    "BIGINT",
+    "REAL",
+    "DOUBLE",
+    "FLOAT",
+    "DECIMAL",
+    "ARRAY",
+    "MAP",
+    "ROW",
+    "JSON",
+    "VARBINARY",
+    "UUID",
+];
+
+/// Rejects a `predicate=` that references a column the table does not have.
+///
+/// Athena would reject it too, but only after `StartQueryExecution`, as an
+/// opaque `COLUMN_NOT_FOUND` on a query the user cannot see. Catching it at bind
+/// names the offending identifier and the columns that do exist.
+///
+/// This is a scan, not a parser: string literals are blanked first, a word
+/// followed by `(` is treated as a function name, and anything in
+/// `PREDICATE_WORDS` is skipped. Everything else must be a known column.
+fn validate_predicate_columns(predicate: &str, columns: &[String]) -> Result<(), String> {
+    let masked = mask_string_literals(predicate);
+    let known: Vec<String> = columns.iter().map(|c| c.to_ascii_lowercase()).collect();
+    let bytes: Vec<char> = masked.chars().collect();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+
+        // Quoted identifier: "col name", with "" as an escaped quote.
+        if c == '"' {
+            let mut name = String::new();
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == '"' {
+                    if bytes.get(i + 1) == Some(&'"') {
+                        name.push('"');
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                name.push(bytes[i]);
+                i += 1;
+            }
+            check_identifier(&name, &known, columns)?;
+            continue;
+        }
+
+        if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == '_') {
+                i += 1;
+            }
+            let word: String = bytes[start..i].iter().collect();
+
+            // A word followed by "(" is a function call, not a column.
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_whitespace() {
+                j += 1;
+            }
+            let is_call = bytes.get(j) == Some(&'(');
+
+            if !is_call && !PREDICATE_WORDS.contains(&word.to_ascii_uppercase().as_str()) {
+                check_identifier(&word, &known, columns)?;
+            }
+            continue;
+        }
+
+        // Skip numeric literals whole so 2024 or 1e6 never looks like an identifier.
+        if c.is_ascii_digit() {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == '.') {
+                i += 1;
+            }
+            continue;
+        }
+
+        i += 1;
+    }
+    Ok(())
+}
+
+fn check_identifier(name: &str, known: &[String], columns: &[String]) -> Result<(), String> {
+    if known.contains(&name.to_ascii_lowercase()) {
+        return Ok(());
+    }
+    Err(format!(
+        "predicate references unknown column \"{name}\"; this table has: {}",
+        columns.join(", ")
+    ))
+}
+
 /// Builds the Athena `SELECT` list from the columns DuckDB actually projected.
 ///
 /// `indices` are positions into `columns` (the bind-time output schema), in the
@@ -574,6 +716,15 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
                 "table \"{database}\".\"{tablename}\" has no columns in the Glue catalog"
             ));
             return;
+        }
+
+        // Column references can only be checked once the Glue schema is known,
+        // so this runs here rather than beside the rest of predicate validation.
+        if let Some(predicate) = predicate.as_deref() {
+            if let Err(e) = validate_predicate_columns(predicate, &columns) {
+                bi.set_error(&e);
+                return;
+            }
         }
 
         FfiBindData::<ScanBindData>::set(
@@ -815,7 +966,7 @@ mod tests {
     use super::{
         build_athena_query, datum_row_to_result_row, mask_string_literals, next_poll_delay,
         parse_optional_arg, projected_select_list, qualified_table, result_output_location,
-        result_row_cell, validate_predicate, POLL_INITIAL, POLL_MAX,
+        result_row_cell, validate_predicate, validate_predicate_columns, POLL_INITIAL, POLL_MAX,
     };
     use aws_sdk_athena::operation::get_query_execution::GetQueryExecutionOutput;
     use aws_sdk_athena::types::{Datum, QueryExecution, ResultConfiguration, Row};
@@ -981,6 +1132,46 @@ mod tests {
         assert_eq!(projected_select_list(&cols(), &[1, 99]), "\"name\"");
         // All out of range collapses to the safe constant.
         assert_eq!(projected_select_list(&cols(), &[99]), "1");
+    }
+
+    #[test]
+    fn predicate_columns_accepts_references_the_table_has() {
+        let cols = cols();
+        assert!(validate_predicate_columns("year = 2024 AND name IS NOT NULL", &cols).is_ok());
+        // Athena lowercases unquoted identifiers, so matching is case-insensitive.
+        assert!(validate_predicate_columns("YEAR > 2000 OR Name LIKE 'a%'", &cols).is_ok());
+        // Quoted identifiers name columns too.
+        assert!(validate_predicate_columns("\"year\" BETWEEN 2000 AND 2024", &cols).is_ok());
+    }
+
+    #[test]
+    fn predicate_columns_rejects_a_column_the_table_lacks() {
+        // The point of the check: a typo becomes a bind error naming the column
+        // instead of an opaque Athena COLUMN_NOT_FOUND after the query starts.
+        let err = validate_predicate_columns("yaer = 2024", &cols()).unwrap_err();
+        assert!(err.contains("yaer"), "{err}");
+        assert!(err.contains("year"), "should list the real columns: {err}");
+        assert!(validate_predicate_columns("year = 2024 AND missing > 1", &cols()).is_err());
+    }
+
+    #[test]
+    fn predicate_columns_ignores_words_inside_string_literals() {
+        // 'New York' must not be read as a reference to a column named New.
+        assert!(validate_predicate_columns("name = 'New York'", &cols()).is_ok());
+        assert!(validate_predicate_columns("name = 'it''s year'", &cols()).is_ok());
+    }
+
+    #[test]
+    fn predicate_columns_allows_functions_literals_and_types() {
+        let cols = cols();
+        // A word before "(" is a function name, not a column.
+        assert!(validate_predicate_columns("lower(name) = 'x'", &cols).is_ok());
+        assert!(validate_predicate_columns("year(  id ) = 2024", &cols).is_ok());
+        // Typed literals, casts and keyword operands are not columns either.
+        assert!(validate_predicate_columns("id > CAST('1' AS BIGINT)", &cols).is_ok());
+        assert!(validate_predicate_columns("year >= DATE '2024-01-01'", &cols).is_ok());
+        assert!(validate_predicate_columns("id IN (1, 2, 3) AND name IS NULL", &cols).is_ok());
+        assert!(validate_predicate_columns("id = 1e6 OR id = 2.5", &cols).is_ok());
     }
 
     #[test]
