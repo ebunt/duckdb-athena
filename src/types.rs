@@ -9,7 +9,17 @@ use quack_rs::{types::TypeId, vector::VectorWriter};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColType {
     Simple(TypeId),
-    Decimal { width: u8, scale: u8 },
+    Decimal {
+        width: u8,
+        scale: u8,
+    },
+    /// A complex Athena type (array, map, struct) selected as `CAST(col AS JSON)`
+    /// and written as `VARCHAR`. Athena's default rendering of these is lossy —
+    /// `array['a,b', 'c']` prints as `[a,b, c]`, where the comma inside the
+    /// element cannot be told from the separator — so the value would be
+    /// unparseable. JSON escapes properly and keeps struct field names, which
+    /// makes DuckDB's json functions usable on the result.
+    Json,
 }
 
 // Maps Athena/Glue data types to DuckDB types.
@@ -34,12 +44,98 @@ pub fn map_type(col_type: &str) -> Result<ColType, String> {
         // values keep numeric typing instead of coming back as strings.
         s if s == "decimal" || s.starts_with("decimal(") => return parse_decimal(s),
         "string" | "varchar" | "char" => TypeId::Varchar,
+        // Complex types are requested as JSON rather than Athena's ambiguous
+        // default text -- but only when Athena can actually perform the cast,
+        // since a rejected cast fails the whole query. Glue spells them
+        // `array<...>`, `map<...>`, `struct<...>`.
+        s if is_complex(s) => {
+            return if json_castable(s) {
+                Ok(ColType::Json)
+            } else {
+                Err(format!("complex type is not JSON-castable: {s}"))
+            }
+        }
         _ => {
             return Err(format!("Unsupported data type: {col_type}"));
         }
     });
 
     Ok(col_type)
+}
+
+fn is_complex(col_type: &str) -> bool {
+    col_type.starts_with("array<")
+        || col_type.starts_with("map<")
+        || col_type.starts_with("struct<")
+}
+
+/// Leaf types Athena will cast to JSON inside an array, map or struct. Measured
+/// against Athena rather than assumed: `char` and `time` are rejected despite
+/// being ordinary scalars, and `binary`/`varbinary` too, while `date`,
+/// `timestamp` and `decimal` are accepted.
+const JSON_CASTABLE_LEAVES: &[&str] = &[
+    "boolean",
+    "tinyint",
+    "smallint",
+    "int",
+    "integer",
+    "bigint",
+    "float",
+    "real",
+    "double",
+    "decimal",
+    "string",
+    "varchar",
+    "date",
+    "timestamp",
+];
+
+/// Whether every leaf of a nested Glue type can be cast to JSON.
+///
+/// Athena rejects the whole cast if any nested type cannot be converted --
+/// `Cannot cast array(varbinary) to json` -- which would turn a scan that used
+/// to return (ambiguous) text into a failed query. Unknown leaves are treated as
+/// not castable, so anything unrecognised keeps the plain-text fallback.
+fn json_castable(col_type: &str) -> bool {
+    let mut chars = col_type.chars().peekable();
+    let mut word = String::new();
+
+    // Type strings look like `array<struct<a:int,b:map<string,date>>>`. Walk
+    // them token by token: `:` marks the preceding word as a struct field name
+    // rather than a type, and `(` starts parameters (decimal(10,2)) that carry
+    // no further type names.
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_ascii_alphanumeric() || c == '_' => word.push(c),
+            ':' => word.clear(), // struct field name, not a type
+            '(' => {
+                // Skip parameters, but keep the word: `decimal(10,2)` is decimal.
+                for p in chars.by_ref() {
+                    if p == ')' {
+                        break;
+                    }
+                }
+                if !check_leaf(&word) {
+                    return false;
+                }
+                word.clear();
+            }
+            _ => {
+                if !check_leaf(&word) {
+                    return false;
+                }
+                word.clear();
+            }
+        }
+    }
+    check_leaf(&word)
+}
+
+/// A token is fine if it is empty, a container keyword, or a castable leaf.
+fn check_leaf(word: &str) -> bool {
+    word.is_empty()
+        || matches!(word, "array" | "map" | "struct")
+        || JSON_CASTABLE_LEAVES.contains(&word)
 }
 
 /// Parses a Glue decimal type string (`decimal`, `decimal(p)`, or `decimal(p,s)`)
@@ -200,6 +296,9 @@ pub unsafe fn populate_column(
                 }
                 return;
             }
+            // JSON arrives as text and is written verbatim; DuckDB's json
+            // functions parse it on demand.
+            ColType::Json => TypeId::Varchar,
             ColType::Simple(type_id) => type_id,
         };
 
@@ -257,6 +356,60 @@ mod tests {
         assert_eq!(
             map_type("timestamp").unwrap(),
             ColType::Simple(TypeId::Timestamp)
+        );
+    }
+
+    #[test]
+    fn map_type_flags_complex_types_as_json() {
+        // These are read as CAST(col AS JSON); Athena's plain text rendering of
+        // them cannot be parsed back (`array['a,b','c']` prints as `[a,b, c]`).
+        assert_eq!(map_type("array<string>").unwrap(), ColType::Json);
+        assert_eq!(map_type("map<string,int>").unwrap(), ColType::Json);
+        assert_eq!(map_type("struct<a:int,b:string>").unwrap(), ColType::Json);
+        assert_eq!(
+            map_type("array<struct<a:int,b:array<string>>>").unwrap(),
+            ColType::Json
+        );
+        // Not complex: a plain string column keeps its own mapping.
+        assert_eq!(
+            map_type("string").unwrap(),
+            ColType::Simple(TypeId::Varchar)
+        );
+    }
+
+    #[test]
+    fn map_type_keeps_text_for_complex_types_athena_cannot_cast() {
+        // Measured against Athena: CAST(array(varbinary) AS JSON) is a
+        // TYPE_MISMATCH, and a rejected cast fails the whole query -- worse than
+        // the ambiguous text this replaces. char and time are rejected too.
+        assert!(map_type("array<binary>").is_err());
+        assert!(map_type("array<varbinary>").is_err());
+        assert!(map_type("struct<b:binary,i:int>").is_err());
+        assert!(map_type("array<char(2)>").is_err());
+        assert!(map_type("map<string,time>").is_err());
+        // Unknown leaves are treated as not castable rather than gambled on.
+        assert!(map_type("array<uniontype<int,string>>").is_err());
+        // Callers turn Err into the plain Varchar fallback, i.e. prior behaviour.
+    }
+
+    #[test]
+    fn map_type_casts_complex_types_athena_accepts() {
+        // Also measured: temporals and decimals do cast, contrary to a plausible
+        // guess that only primitives would.
+        assert_eq!(map_type("array<date>").unwrap(), ColType::Json);
+        assert_eq!(map_type("array<timestamp>").unwrap(), ColType::Json);
+        assert_eq!(map_type("struct<d:date>").unwrap(), ColType::Json);
+        assert_eq!(map_type("map<varchar(3),date>").unwrap(), ColType::Json);
+        assert_eq!(map_type("array<decimal(10,2)>").unwrap(), ColType::Json);
+        assert_eq!(
+            map_type("array<struct<a:int,b:map<string,double>>>").unwrap(),
+            ColType::Json
+        );
+        // A struct field named after a type is a field name, not a leaf type.
+        assert_eq!(map_type("struct<binary:string>").unwrap(), ColType::Json);
+        assert_eq!(
+            map_type("struct<time:int,char:date>").unwrap(),
+            ColType::Json
         );
     }
 

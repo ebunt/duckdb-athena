@@ -257,7 +257,14 @@ SELECT COUNT(*) FROM athena_scan('my_table');
 
 ## Limitations
 
-- Not all Athena data types are supported (complex types: array, map, struct)
+- Complex types (`array`, `map`, `struct`) come back as JSON text, not native DuckDB `LIST`/`STRUCT`/`MAP`. They are selected as `CAST(col AS JSON)`, because Athena's default rendering is ambiguous — `array['a,b', 'c']` prints as `[a,b, c]`, where the comma inside the element cannot be told from the separator. Query them with DuckDB's json functions:
+
+  ```sql
+  SELECT json_extract_string(tags, '$[0]'), json_extract_string(info, '$.s')
+  FROM athena_scan('events');
+  ```
+
+  A complex column whose nested types Athena cannot cast to JSON — `binary`/`varbinary`, `char`, `time`, or anything unrecognised — keeps the old plain-text rendering instead, since a rejected cast would fail the whole query. The decision is per column, so one such column does not affect the others.
 - `predicate=` is validated at bind: it must be a single `WHERE` expression, and every column it names must exist in the table, so a typo fails immediately instead of after the Athena query starts
 - Automatic *filter* pushdown is not implemented — the DuckDB C loadable-extension API exposes projection pushdown but no table-filter callback, so `WHERE` clauses are evaluated in DuckDB after Athena returns rows. Use `predicate=` to push a filter into Athena manually.
 - Returns all rows by default; pass `maxrows=N` to cap (an outer DuckDB `LIMIT` is not pushed to Athena)
