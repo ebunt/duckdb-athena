@@ -25,10 +25,21 @@ return.
 - **Live AWS integration tests.** Gate behind env vars (`ATHENA_TEST_DATABASE`,
   `ATHENA_TEST_TABLE`, `ATHENA_TEST_OUTPUT`); assert partition predicates reduce
   `data_scanned_in_bytes`. Not wired into CI (needs credentials + fixtures).
-  Two paths currently have unit coverage but have never run against live AWS:
-  the `GetQueryResults` fallback (needs a workgroup using Athena-managed query
-  results) and native `DATE`/`TIMESTAMP`/`DECIMAL` columns (needs a table that
-  has them).
+
+  Both paths that had only unit coverage have since been checked by hand
+  against live Athena (2026-08-30), on throwaway resources deleted afterwards:
+
+  - **`GetQueryResults` fallback** — a workgroup with
+    `ManagedQueryResultsConfiguration` enabled produces executions whose
+    `ResultConfiguration.OutputLocation` is null, so the scan pages instead of
+    reading S3. `sampledb.elb_logs` returned 4229 rows and `SUM(sentbytes)` of
+    35299472, identical to the S3 path; `maxrows=2500` capped correctly.
+  - **Native `DATE`/`TIMESTAMP`/`DECIMAL`** — a CTAS table with those Glue types
+    round-tripped exactly through both paths: pre-epoch `1969-12-31`, millisecond
+    timestamps, `DECIMAL(10,2)` values `-0.05`/`1234.56`/`0.00`, NULLs preserved
+    per column, and an empty string staying empty rather than becoming NULL.
+
+  Neither check is automated, so both can regress silently.
 
 ## Open review finding
 
