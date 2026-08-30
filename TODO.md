@@ -26,10 +26,16 @@ statement keywords, and every column it names must exist in the Glue schema.
 
 - **Optimizer-driven filter pushdown.** `libduckdb-sys` exposes projection
   pushdown but no table-filter callback / `duckdb_table_filter` accessors, so a
-  plain `WHERE` cannot be pushed into Athena automatically. Real predicate
-  pushdown needs the DuckDB C++ extension API — a separate architectural
-  decision. Manual `predicate=` is the supported path until then. Design notes
-  for that path are kept at the bottom of this file.
+  plain `WHERE` cannot be pushed into Athena automatically. Confirmed against
+  the v1.2.0 bindings: the string `filter` does not appear in them at all.
+
+  Real predicate pushdown needs the DuckDB C++ extension API, which means
+  rebuilding and re-releasing per DuckDB version instead of one C-API build that
+  loads across 1.x — roughly 1-2 weeks to port, plus 2-3 days for the predicate
+  translation below, plus that ongoing tax. A feature request asking for filters
+  in the C API is drafted at `docs/upstream-issue-filter-pushdown.md` (not filed
+  yet); asking is cheaper than porting. Manual `predicate=` is the supported
+  path meanwhile.
 
 ## Deferred
 
