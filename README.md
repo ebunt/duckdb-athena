@@ -258,6 +258,7 @@ SELECT COUNT(*) FROM athena_scan('my_table');
 ## Limitations
 
 - Not all Athena data types are supported (complex types: array, map, struct)
+- `predicate=` is validated at bind: it must be a single `WHERE` expression, and every column it names must exist in the table, so a typo fails immediately instead of after the Athena query starts
 - Automatic *filter* pushdown is not implemented — the DuckDB C loadable-extension API exposes projection pushdown but no table-filter callback, so `WHERE` clauses are evaluated in DuckDB after Athena returns rows. Use `predicate=` to push a filter into Athena manually.
 - Returns all rows by default; pass `maxrows=N` to cap (an outer DuckDB `LIMIT` is not pushed to Athena)
 - Results are streamed from the query's result CSV on S3 (one `GetObject`), which needs `s3:GetObject` on the results bucket. Workgroups using Athena-managed query results expose no S3 location, so those fall back to `GetQueryResults` paging at 1000 rows per call (~8 rows/ms)
