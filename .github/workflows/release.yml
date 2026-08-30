@@ -111,8 +111,11 @@ jobs:
                   name: duckdb_athena-${{ matrix.platform }}
                   path: dist
 
+            # The installer is a bash script: piping it to sh runs it under
+            # dash on Ubuntu, where `[[` is not a builtin, so platform
+            # detection silently falls through to a 404 download.
             - name: Install DuckDB CLI
-              run: curl -fsSL https://install.duckdb.org | sh
+              run: curl -fsSL https://install.duckdb.org | bash
 
             # Catches the failure mode that shipped in v0.2.0: an asset that
             # builds and uploads fine but cannot be loaded on its own platform.
