@@ -3,9 +3,13 @@
 Current state: `athena_scan` registers schema from Glue in `read_athena_bind`,
 reads DuckDB's projected columns in `read_athena_init`, submits
 `SELECT <projection> FROM "db"."table" [WHERE predicate] [LIMIT n]` to Athena,
-then streams one result page per `read_athena` call (peak memory is a single
-page). Column projection is pushed into Athena; filtering with `predicate=` is
-manual, and a plain DuckDB `WHERE` runs locally after rows return.
+then streams the result CSV Athena wrote to S3 — one `GetObject`, parsed
+incrementally, a vector of rows per `read_athena` call, so peak memory stays
+near one byte chunk. `GetQueryResults` paging (1000 rows per call) remains only
+as the fallback for executions exposing no S3 location, e.g. Athena-managed
+query results. Column projection is pushed into Athena; filtering with
+`predicate=` is manual, and a plain DuckDB `WHERE` runs locally after rows
+return.
 
 ## Blocked
 
@@ -21,6 +25,10 @@ manual, and a plain DuckDB `WHERE` runs locally after rows return.
 - **Live AWS integration tests.** Gate behind env vars (`ATHENA_TEST_DATABASE`,
   `ATHENA_TEST_TABLE`, `ATHENA_TEST_OUTPUT`); assert partition predicates reduce
   `data_scanned_in_bytes`. Not wired into CI (needs credentials + fixtures).
+  Two paths currently have unit coverage but have never run against live AWS:
+  the `GetQueryResults` fallback (needs a workgroup using Athena-managed query
+  results) and native `DATE`/`TIMESTAMP`/`DECIMAL` columns (needs a table that
+  has them).
 
 ## Open review finding
 
