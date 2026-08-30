@@ -128,6 +128,39 @@ else
 fi
 
 echo
+echo "-- partitioned tables: column order, metadata-only reads, pruning"
+# Glue keeps partition keys separate from data columns, and Athena returns them
+# last in SELECT *; bind has to register them in that order or every value lands
+# in the wrong column. Needs a partitioned fixture, so it is skipped when absent.
+PART_TABLE="${ATHENA_TEST_PARTITIONED_TABLE:-default.claude_part_test}"
+part_db="${PART_TABLE%%.*}"
+part_tbl="${PART_TABLE##*.}"
+if aws glue get-table --database-name "$part_db" --name "$part_tbl" > /dev/null 2>&1; then
+    expected=$(aws glue get-table --database-name "$part_db" --name "$part_tbl" \
+        --query 'join(`,`, Table.StorageDescriptor.Columns[].Name)' --output text)
+    expected="$expected,$(aws glue get-table --database-name "$part_db" --name "$part_tbl" \
+        --query 'join(`,`, Table.PartitionKeys[].Name)' --output text)"
+    actual=$(duckdb -unsigned -noheader -list -c "LOAD '$EXTENSION';
+        SELECT string_agg(column_name, ',') FROM (
+            DESCRIBE SELECT * FROM athena_scan('$part_tbl', database='$part_db')
+        );" 2>/dev/null)
+    check "partition columns come last" "$expected" "$actual"
+
+    parts=$(aws glue get-table --database-name "$part_db" --name "$part_tbl" \
+        --query 'Table.PartitionKeys[0].Name' --output text)
+    # Selecting only a partition column reads no data at all: the values live in
+    # the catalog, so Athena reports 0 bytes scanned.
+    duck "SELECT COUNT(DISTINCT $parts) FROM athena_scan('$part_tbl', database='$part_db');" > /dev/null
+    last=$(aws athena list-query-executions --work-group "$WORKGROUP" --max-items 1 \
+        --query 'QueryExecutionIds[0]' --output text | head -1)
+    scanned=$(aws athena get-query-execution --query-execution-id "$last" \
+        --query 'QueryExecution.Statistics.DataScannedInBytes' --output text)
+    check "partition-only scan reads 0 bytes" "0" "$scanned"
+else
+    printf 'skip %-42s no partitioned fixture (%s)\n' "partitioned table checks" "$PART_TABLE"
+fi
+
+echo
 echo "-- predicate validation rejects unknown columns at bind"
 if duckdb -unsigned -c "LOAD '$EXTENSION';
     SELECT 1 FROM athena_scan('elb_logs', database='sampledb', predicate='nosuchcol = 1');" \

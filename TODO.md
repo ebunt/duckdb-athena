@@ -56,7 +56,16 @@ statement keywords, and every column it names must exist in the Glue schema.
     timestamps, `DECIMAL(10,2)` values `-0.05`/`1234.56`/`0.00`, NULLs preserved
     per column, and an empty string staying empty rather than becoming NULL.
 
-  Neither check is automated, but `scripts/live-check.sh` now covers the rest:
+  Partitioned tables were checked on 2026-08-30 and behave correctly: Glue keeps
+  partition keys separate from data columns and Athena returns them last in
+  `SELECT *`, which is the order bind registers them in. Selecting only a
+  partition column reads 0 bytes (the values come from the catalog), and a
+  `predicate=` on a partition key prunes (284 -> 189 bytes on the fixture). Two
+  of these are now in `live-check.sh`, guarded on a partitioned fixture existing
+  (`ATHENA_TEST_PARTITIONED_TABLE`, default `default.claude_part_test`).
+
+  Neither of the two checks above is automated, but `scripts/live-check.sh` now
+  covers the rest:
   value parity against Athena computing the same aggregates, a full scan
   completing in seconds rather than paging, `maxrows`/`predicate` reaching
   Athena, projection pushdown asserted against the SQL Athena actually
