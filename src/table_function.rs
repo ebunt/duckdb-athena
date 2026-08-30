@@ -388,6 +388,13 @@ const PREDICATE_WORDS: &[&str] = &[
     "THEN",
     "ELSE",
     "END",
+    // Grammar words that appear inside expressions: EXTRACT(YEAR FROM ts),
+    // INTERVAL '1' DAY TO SECOND, ts AT TIME ZONE 'UTC', DOUBLE PRECISION.
+    "FROM",
+    "TO",
+    "AT",
+    "PRECISION",
+    "LOCAL",
     "DATE",
     "TIME",
     "TIMESTAMP",
@@ -471,8 +478,14 @@ fn validate_predicate_columns(predicate: &str, columns: &[String]) -> Result<(),
                 j += 1;
             }
             let is_call = bytes.get(j) == Some(&'(');
+            let is_word = PREDICATE_WORDS.contains(&word.to_ascii_uppercase().as_str());
+            // A listed word standing directly before a comparison operator is an
+            // operand, not grammar, so it names a column: `year = 2024` is a
+            // column reference even though YEAR is also an EXTRACT unit. Without
+            // this, every keyword-shaped column name skips validation entirely.
+            let compared = matches!(bytes.get(j), Some('=' | '<' | '>' | '!'));
 
-            if !is_call && !PREDICATE_WORDS.contains(&word.to_ascii_uppercase().as_str()) {
+            if !is_call && (!is_word || compared) {
                 check_identifier(&word, &known, columns)?;
             }
             continue;
@@ -1172,6 +1185,37 @@ mod tests {
         assert!(validate_predicate_columns("year >= DATE '2024-01-01'", &cols).is_ok());
         assert!(validate_predicate_columns("id IN (1, 2, 3) AND name IS NULL", &cols).is_ok());
         assert!(validate_predicate_columns("id = 1e6 OR id = 2.5", &cols).is_ok());
+    }
+
+    #[test]
+    fn predicate_columns_allows_sql_grammar_inside_expressions() {
+        // Regression: FROM inside EXTRACT was read as a column reference, so a
+        // valid predicate was rejected at bind unless the table happened to have
+        // a column named "from".
+        let cols = vec!["event_time".to_string(), "id".to_string()];
+        assert!(validate_predicate_columns("EXTRACT(YEAR FROM event_time) = 2024", &cols).is_ok());
+        assert!(validate_predicate_columns("id > CAST(1 AS DOUBLE PRECISION)", &cols).is_ok());
+        assert!(validate_predicate_columns(
+            "event_time AT TIME ZONE 'UTC' > TIMESTAMP '2024-01-01 00:00:00'",
+            &cols
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn predicate_columns_checks_keyword_shaped_names_that_are_compared() {
+        // YEAR is both an EXTRACT unit and a perfectly ordinary column name.
+        // Standing before a comparison it is an operand, so it gets checked.
+        let without = vec!["id".to_string()];
+        assert!(validate_predicate_columns("year = 2024", &without).is_err());
+        assert!(validate_predicate_columns("year>2024", &without).is_err());
+
+        let with = vec!["year".to_string()];
+        assert!(validate_predicate_columns("year = 2024", &with).is_ok());
+
+        // ...but the same words in grammar positions are still not columns.
+        assert!(validate_predicate_columns("id IS NOT NULL", &without).is_ok());
+        assert!(validate_predicate_columns("id > DATE '2024-01-01'", &without).is_ok());
     }
 
     #[test]
