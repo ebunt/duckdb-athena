@@ -1,0 +1,1033 @@
+use aws_config::BehaviorVersion;
+use aws_sdk_athena::{
+    operation::get_query_execution::GetQueryExecutionOutput,
+    operation::get_query_results::GetQueryResultsOutput,
+    types::{
+        QueryExecutionState::{self, *},
+        ResultConfiguration, Row,
+    },
+    Client as AthenaClient,
+};
+use aws_sdk_glue::Client as GlueClient;
+use libduckdb_sys::{
+    duckdb_bind_info, duckdb_data_chunk, duckdb_data_chunk_set_size, duckdb_function_info,
+    duckdb_function_set_error, duckdb_init_info, idx_t,
+};
+use quack_rs::{
+    table::{BindInfo, FfiBindData, FfiInitData, InitInfo, TableFunctionBuilder},
+    types::{LogicalType, TypeId},
+};
+use std::{
+    ffi::CString,
+    thread,
+    time::{Duration, Instant},
+};
+
+use crate::results::{parse_s3_uri, CsvRowStream, ResultRow};
+use crate::types::{map_type, populate_column, ColType};
+
+struct ScanBindData {
+    tablename: String,
+    database: String,
+    /// Explicit S3 results location, or `None` to let Athena apply the
+    /// workgroup's own result configuration.
+    output_location: Option<String>,
+    workgroup: String,
+    limit: i32,
+    predicate: Option<String>,
+    /// Output column names in the order registered with DuckDB: data columns
+    /// first, then partition columns. Used to map DuckDB's projected column
+    /// indexes back to Athena column names for projection pushdown.
+    columns: Vec<String>,
+    /// Resolved DuckDB type of each column in `columns` (same order). Carried
+    /// from bind so the scan writes each value — decimals especially — with the
+    /// exact physical width registered here, never re-derived from result metadata.
+    col_types: Vec<ColType>,
+}
+
+/// Lazily fetches the next Athena result page: `None` at end of stream, `Err`
+/// on a page-fetch failure. Boxing keeps the concrete paginator type internal
+/// to `read_athena_init` (no smithy types to name here). It is `Send + 'static`
+/// — all `FfiInitData` requires. `athena_scan` registers no `local_init` and
+/// never raises `max_threads` above DuckDB's default of 1, so `read_athena`
+/// runs single-threaded and this need not be `Sync`.
+type PageFetcher = Box<dyn FnMut() -> Option<Result<GetQueryResultsOutput, String>> + Send>;
+
+/// How the scan reads the finished query's results.
+enum ScanMode {
+    /// Stream the single CSV object Athena wrote to S3: one `GetObject` for the
+    /// whole result set instead of a `GetQueryResults` round trip per 1000 rows.
+    Csv { rows: CsvRowStream },
+    /// Fallback when the execution exposes no S3 result location (a workgroup
+    /// using Athena-managed query results) or S3 is unreadable: page
+    /// `GetQueryResults` 1000 rows at a time.
+    Pages {
+        next_page: PageFetcher,
+        /// The first Athena page's first row is the column header, skipped once.
+        first_page: bool,
+    },
+}
+
+struct ScanInitData {
+    mode: ScanMode,
+    /// Resolved type of each projected column, in the order DuckDB projected them
+    /// (which is also Athena's SELECT-list order), so writes are positional.
+    col_types: Vec<ColType>,
+    done: bool,
+}
+
+/// # Safety
+#[no_mangle]
+unsafe extern "C" fn read_athena(info: duckdb_function_info, output: duckdb_data_chunk) {
+    unsafe {
+        let Some(state) = FfiInitData::<ScanInitData>::get_mut(info) else {
+            duckdb_data_chunk_set_size(output, 0);
+            return;
+        };
+        if state.done {
+            duckdb_data_chunk_set_size(output, 0);
+            return;
+        }
+
+        let (page, was_first) = match &mut state.mode {
+            // Read the next vector's worth of rows straight from the result CSV.
+            ScanMode::Csv { rows } => {
+                let capacity = libduckdb_sys::duckdb_vector_size() as usize;
+                match rows.next_rows(capacity) {
+                    Ok(rows) => {
+                        if rows.is_empty() {
+                            state.done = true;
+                        }
+                        if let Err(e) = rows_to_duckdb_data_chunk(&rows, &state.col_types, output) {
+                            let msg = CString::new(e).unwrap_or_default();
+                            duckdb_function_set_error(info, msg.as_ptr());
+                            duckdb_data_chunk_set_size(output, 0);
+                            state.done = true;
+                        }
+                    }
+                    Err(e) => {
+                        let msg = CString::new(e).unwrap_or_default();
+                        duckdb_function_set_error(info, msg.as_ptr());
+                        duckdb_data_chunk_set_size(output, 0);
+                        state.done = true;
+                    }
+                }
+                return;
+            }
+            // Fetch the next page lazily. Any page-fetch error surfaces here
+            // rather than at init, so a query can emit earlier pages before
+            // failing.
+            ScanMode::Pages {
+                next_page,
+                first_page,
+            } => match next_page() {
+                Some(Ok(page)) => {
+                    let was_first = *first_page;
+                    *first_page = false;
+                    (page, was_first)
+                }
+                Some(Err(e)) => {
+                    let msg = CString::new(e).unwrap_or_default();
+                    duckdb_function_set_error(info, msg.as_ptr());
+                    duckdb_data_chunk_set_size(output, 0);
+                    state.done = true;
+                    return;
+                }
+                None => {
+                    duckdb_data_chunk_set_size(output, 0);
+                    state.done = true;
+                    return;
+                }
+            },
+        };
+
+        let Some(rs) = page.result_set() else {
+            duckdb_data_chunk_set_size(output, 0);
+            state.done = true;
+            return;
+        };
+        let rows = rs.rows();
+        // Athena returns the column header as the first row of the first page.
+        let rows_slice: &[Row] = if was_first && !rows.is_empty() {
+            &rows[1..]
+        } else {
+            rows
+        };
+        let rows_owned: Vec<ResultRow> = rows_slice.iter().map(datum_row_to_result_row).collect();
+        if let Err(e) = rows_to_duckdb_data_chunk(&rows_owned, &state.col_types, output) {
+            let msg = CString::new(e).unwrap_or_default();
+            duckdb_function_set_error(info, msg.as_ptr());
+            duckdb_data_chunk_set_size(output, 0);
+            state.done = true;
+        }
+    }
+}
+
+/// Converts one `GetQueryResults` row into the shape both paths write from.
+fn datum_row_to_result_row(row: &Row) -> ResultRow {
+    row.data()
+        .iter()
+        .map(|d| d.var_char_value().map(str::to_owned))
+        .collect()
+}
+
+/// Value to write for one cell. `None` means SQL NULL, including trailing cells
+/// in ragged rows.
+fn result_row_cell(row: &ResultRow, col_idx: usize) -> Option<&str> {
+    row.get(col_idx).and_then(|c| c.as_deref())
+}
+
+pub fn rows_to_duckdb_data_chunk(
+    rows: &[ResultRow],
+    col_types: &[ColType],
+    chunk: duckdb_data_chunk,
+) -> Result<(), String> {
+    let result_size = rows.len();
+    let chunk_col_count =
+        unsafe { libduckdb_sys::duckdb_data_chunk_get_column_count(chunk) } as usize;
+
+    // DuckDB data chunk vectors hold at most STANDARD_VECTOR_SIZE rows. Both
+    // paths hand over at most that many (a `GetQueryResults` page caps at 1000),
+    // but fail loud rather than write out of bounds if that ever changes.
+    let capacity = unsafe { libduckdb_sys::duckdb_vector_size() } as usize;
+    if result_size > capacity {
+        return Err(format!(
+            "Athena result page has {result_size} rows, exceeding DuckDB's vector capacity of {capacity}"
+        ));
+    }
+
+    // Write every chunk column for every row. Bounded by both the resolved
+    // column types and the DuckDB chunk column counts so we never write past the
+    // chunk boundary if they diverge (e.g. unsupported column types skipped).
+    let col_count = col_types.len().min(chunk_col_count);
+    for (row_idx, row) in rows.iter().enumerate() {
+        for (col_idx, &col_type) in col_types.iter().take(col_count).enumerate() {
+            unsafe {
+                populate_column(
+                    result_row_cell(row, col_idx),
+                    col_type,
+                    chunk,
+                    row_idx,
+                    col_idx,
+                )
+            };
+        }
+    }
+
+    unsafe { duckdb_data_chunk_set_size(chunk, result_size as idx_t) };
+
+    Ok(())
+}
+
+/// First delay before re-polling query state; grows via `next_poll_delay`.
+const POLL_INITIAL: Duration = Duration::from_millis(250);
+/// Ceiling for the poll backoff, so long queries still poll at least this often.
+const POLL_MAX: Duration = Duration::from_secs(5);
+/// Backstop so a query that never resolves can't hang DuckDB forever. Athena's
+/// own DML timeout (default 30 min) normally fails a stuck query first; this
+/// only catches genuine indefinite hangs.
+// ponytail: fixed 60-min ceiling; promote to a `timeout=` param if a workgroup
+// raises Athena's own query limit past this.
+const MAX_POLL_WAIT: Duration = Duration::from_secs(60 * 60);
+
+/// Next poll delay: exponential backoff doubling up to `cap`.
+fn next_poll_delay(current: Duration, cap: Duration) -> Duration {
+    (current * 2).min(cap)
+}
+
+fn status(resp: &GetQueryExecutionOutput) -> Option<QueryExecutionState> {
+    resp.query_execution()
+        .and_then(|qe| qe.status())
+        .and_then(|s| s.state())
+        .cloned()
+}
+
+fn print_query_stats(resp: &GetQueryExecutionOutput) {
+    let stats = resp.query_execution().and_then(|qe| qe.statistics());
+    let Some(s) = stats else { return };
+
+    if let Some(queue_ms) = s.query_queue_time_in_millis() {
+        eprintln!("Time in queue: {} ms", queue_ms);
+    }
+    if let Some(run_ms) = s.engine_execution_time_in_millis() {
+        eprintln!("Run time: {} ms", run_ms);
+    }
+    if let Some(bytes) = s.data_scanned_in_bytes() {
+        eprintln!("Data scanned: {}", format_bytes(bytes));
+    }
+}
+
+fn format_bytes(bytes: i64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.2} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.2} KB", b / KB)
+    } else {
+        format!("{} bytes", bytes)
+    }
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn qualified_table(database: &str, tablename: &str) -> String {
+    format!(
+        "{}.{}",
+        quote_identifier(database),
+        quote_identifier(tablename)
+    )
+}
+
+/// Blanks out the contents of single-quoted string literals (keeping the
+/// quotes themselves and every other byte in place), so a keyword scan over
+/// the result only sees actual SQL syntax, not literal text. A doubled `''`
+/// (SQL's escaped quote) stays inside the literal rather than closing it.
+fn mask_string_literals(predicate: &str) -> String {
+    let mut masked = String::with_capacity(predicate.len());
+    let mut chars = predicate.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if !in_string {
+            masked.push(c);
+            if c == '\'' {
+                in_string = true;
+            }
+            continue;
+        }
+        if c == '\'' {
+            if chars.peek() == Some(&'\'') {
+                masked.push(' ');
+                masked.push(' ');
+                chars.next();
+            } else {
+                masked.push('\'');
+                in_string = false;
+            }
+        } else {
+            masked.push(' ');
+        }
+    }
+    masked
+}
+
+fn validate_predicate(predicate: &str) -> Result<String, String> {
+    let predicate = predicate.trim();
+    if predicate.is_empty() {
+        return Err("predicate must not be empty".to_string());
+    }
+    if predicate.contains('\0') {
+        return Err("predicate must not contain NUL bytes".to_string());
+    }
+    if predicate.contains(';') {
+        return Err("predicate must be a single WHERE expression without semicolons".to_string());
+    }
+    if predicate.contains("--") || predicate.contains("/*") || predicate.contains("*/") {
+        return Err("predicate must not contain SQL comments".to_string());
+    }
+
+    // Keyword scan only looks at real SQL syntax: string-literal contents are
+    // blanked first so a value like `name = 'DROP everything'` isn't mistaken
+    // for a DROP statement.
+    let uppercase = mask_string_literals(predicate).to_ascii_uppercase();
+    for keyword in [
+        " SELECT ",
+        " INSERT ",
+        " UPDATE ",
+        " DELETE ",
+        " CREATE ",
+        " DROP ",
+        " ALTER ",
+        " TRUNCATE ",
+        " UNLOAD ",
+        " MSCK ",
+        " REPAIR ",
+    ] {
+        if format!(" {uppercase} ").contains(keyword) {
+            return Err(
+                "predicate must be a WHERE expression, not a full SQL statement".to_string(),
+            );
+        }
+    }
+
+    Ok(predicate.to_owned())
+}
+
+/// Builds the Athena `SELECT` list from the columns DuckDB actually projected.
+///
+/// `indices` are positions into `columns` (the bind-time output schema), in the
+/// order DuckDB wants them. When empty (e.g. `COUNT(*)`), selects the constant
+/// `1` so Athena scans no column data but still returns one row per source row.
+fn projected_select_list(columns: &[String], indices: &[usize]) -> String {
+    let cols: Vec<String> = indices
+        .iter()
+        .filter_map(|&i| columns.get(i))
+        .map(|c| quote_identifier(c))
+        .collect();
+    if cols.is_empty() {
+        "1".to_string()
+    } else {
+        cols.join(", ")
+    }
+}
+
+/// Normalizes an optional string argument: `None` means the parameter was
+/// omitted; an explicitly provided empty/whitespace value is an error rather
+/// than a silent fallback to a default.
+fn parse_optional_arg(name: &str, raw: Option<&str>) -> Result<Option<String>, String> {
+    match raw {
+        None => Ok(None),
+        Some(s) if s.trim().is_empty() => Err(format!(
+            "{name} must not be empty; omit it to use the default"
+        )),
+        Some(s) => Ok(Some(s.trim().to_owned())),
+    }
+}
+
+fn build_athena_query(
+    select_list: &str,
+    database: &str,
+    tablename: &str,
+    predicate: Option<&str>,
+    maxrows: i32,
+) -> String {
+    let mut query = format!(
+        "SELECT {} FROM {}",
+        select_list,
+        qualified_table(database, tablename)
+    );
+    if let Some(predicate) = predicate {
+        query.push_str(" WHERE ");
+        query.push_str(predicate);
+    }
+    if maxrows > 0 {
+        query.push_str(&format!(" LIMIT {maxrows}"));
+    }
+    query
+}
+
+/// # Safety
+#[no_mangle]
+unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
+    unsafe {
+        let bi = BindInfo::new(bind_info);
+        if bi.parameter_count() < 1 {
+            bi.set_error("athena_scan requires at least 1 parameter: tablename");
+            return;
+        }
+
+        let tablename = match bi.get_parameter_value(0).as_str() {
+            Ok(s) => s,
+            Err(e) => {
+                bi.set_error(&e.to_string());
+                return;
+            }
+        };
+        // Reads a named string parameter as Option: None when omitted/null,
+        // Some(value) otherwise. Surfaces a wrong-type error via bind.
+        let named_str = |name: &str| -> Result<Option<String>, ()> {
+            let val = bi.get_named_parameter_value(name);
+            if val.is_null() {
+                Ok(None)
+            } else {
+                match val.as_str() {
+                    Ok(s) => Ok(Some(s)),
+                    Err(e) => {
+                        bi.set_error(&e.to_string());
+                        Err(())
+                    }
+                }
+            }
+        };
+
+        // Optional explicit S3 results location. When omitted, no client
+        // ResultConfiguration is sent and Athena applies the workgroup's own
+        // config (location, encryption, ACL, managed results). An explicitly
+        // empty value is an error, not a silent fallback.
+        let Ok(output_location_raw) = named_str("output_location") else {
+            return;
+        };
+        let output_location =
+            match parse_optional_arg("output_location", output_location_raw.as_deref()) {
+                Ok(loc) => loc,
+                Err(e) => {
+                    bi.set_error(&e);
+                    return;
+                }
+            };
+
+        // Workgroup defaults to `primary` when omitted; an explicitly empty
+        // value is an error.
+        let Ok(workgroup_raw) = named_str("workgroup") else {
+            return;
+        };
+        let workgroup = match parse_optional_arg("workgroup", workgroup_raw.as_deref()) {
+            Ok(wg) => wg.unwrap_or_else(|| "primary".to_owned()),
+            Err(e) => {
+                bi.set_error(&e);
+                return;
+            }
+        };
+        // maxrows > 0 caps the Athena query with `LIMIT n`. Unset (null) or any
+        // value <= 0 (e.g. maxrows=-1) means no limit: return all rows so
+        // aggregates and joins over athena_scan see the full table.
+        let maxrows_val = bi.get_named_parameter_value("maxrows");
+        let maxrows = if maxrows_val.is_null() {
+            0
+        } else {
+            maxrows_val.as_i32()
+        };
+        // Database defaults to `default` when omitted; an explicitly empty or
+        // wrong-type value is an error, not a silent fallback.
+        let Ok(database_raw) = named_str("database") else {
+            return;
+        };
+        let database = match parse_optional_arg("database", database_raw.as_deref()) {
+            Ok(db) => db.unwrap_or_else(|| "default".to_owned()),
+            Err(e) => {
+                bi.set_error(&e);
+                return;
+            }
+        };
+        let predicate = {
+            let predicate_val = bi.get_named_parameter_value("predicate");
+            if predicate_val.is_null() {
+                None
+            } else {
+                match predicate_val.as_str() {
+                    Ok(s) if s.trim().is_empty() => None,
+                    Ok(s) => match validate_predicate(&s) {
+                        Ok(predicate) => Some(predicate),
+                        Err(e) => {
+                            bi.set_error(&e);
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        bi.set_error(&e.to_string());
+                        return;
+                    }
+                }
+            }
+        };
+
+        let config =
+            crate::RUNTIME.block_on(aws_config::defaults(BehaviorVersion::latest()).load());
+        let client = GlueClient::new(&config);
+
+        let table_result = crate::RUNTIME.block_on(
+            client
+                .get_table()
+                .database_name(database.clone())
+                .name(tablename.clone())
+                .send(),
+        );
+
+        let mut columns: Vec<String> = Vec::new();
+        let mut col_types: Vec<ColType> = Vec::new();
+        // Resolves a Glue column type, registers the DuckDB output column with
+        // the right logical type (native DECIMAL(width, scale) when applicable,
+        // else the plain TypeId), and returns the resolved type. Unmappable types
+        // fall back to Varchar.
+        let mut register = |name: &str, type_str: &str| {
+            let col_type = map_type(type_str).unwrap_or(ColType::Simple(TypeId::Varchar));
+            match col_type {
+                ColType::Decimal { width, scale } => {
+                    bi.add_result_column_with_type(name, &LogicalType::decimal(width, scale));
+                }
+                ColType::Simple(type_id) => {
+                    bi.add_result_column(name, type_id);
+                }
+            }
+            columns.push(name.to_string());
+            col_types.push(col_type);
+        };
+        match table_result {
+            Ok(resp) => {
+                if let Some(table) = resp.table() {
+                    if let Some(sd) = table.storage_descriptor() {
+                        for column in sd.columns() {
+                            register(column.name(), column.r#type().unwrap_or("varchar"));
+                        }
+                    }
+                    // Partition columns come after data columns in Athena's SELECT * results.
+                    // Registering them here keeps the DuckDB chunk column count in sync.
+                    for column in table.partition_keys() {
+                        register(column.name(), column.r#type().unwrap_or("varchar"));
+                    }
+                }
+            }
+            Err(err) => {
+                bi.set_error(&err.into_service_error().to_string());
+                return;
+            }
+        }
+
+        if columns.is_empty() {
+            bi.set_error(&format!(
+                "table \"{database}\".\"{tablename}\" has no columns in the Glue catalog"
+            ));
+            return;
+        }
+
+        FfiBindData::<ScanBindData>::set(
+            bind_info,
+            ScanBindData {
+                tablename,
+                database,
+                output_location,
+                workgroup,
+                limit: maxrows,
+                predicate,
+                columns,
+                col_types,
+            },
+        );
+    }
+}
+
+/// S3 location of a finished query's result file, or `None` when the execution
+/// exposes none (Athena-managed query results).
+fn result_output_location(resp: &GetQueryExecutionOutput) -> Option<&str> {
+    resp.query_execution()
+        .and_then(|qe| qe.result_configuration())
+        .and_then(|rc| rc.output_location())
+        .filter(|loc| !loc.is_empty())
+}
+
+/// Opens the result CSV for streaming. `Ok(None)` means there is no S3 location
+/// to read, which is a fallback rather than a failure.
+fn open_result_csv(
+    config: &aws_config::SdkConfig,
+    resp: &GetQueryExecutionOutput,
+) -> Result<Option<CsvRowStream>, String> {
+    let Some(location) = result_output_location(resp) else {
+        return Ok(None);
+    };
+    let (bucket, key) = parse_s3_uri(location)?;
+    let s3 = aws_sdk_s3::Client::new(config);
+    let object = crate::RUNTIME
+        .block_on(s3.get_object().bucket(bucket).key(key).send())
+        .map_err(|e| format!("reading {location}: {e}"))?;
+    Ok(Some(CsvRowStream::new(object.body)))
+}
+
+/// The `GetQueryResults` paging fallback: one page per scan call.
+fn paged_mode(client: &AthenaClient, query_execution_id: &str) -> ScanMode {
+    let mut paginator = client
+        .get_query_results()
+        .query_execution_id(query_execution_id.to_owned())
+        .into_paginator()
+        .send();
+    let next_page: PageFetcher = Box::new(move || {
+        crate::RUNTIME
+            .block_on(paginator.next())
+            .map(|r| r.map_err(|e| e.to_string()))
+    });
+    ScanMode::Pages {
+        next_page,
+        first_page: true,
+    }
+}
+
+/// # Safety
+#[no_mangle]
+unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
+    unsafe {
+        let bind_data = match FfiBindData::<ScanBindData>::get_from_init(info) {
+            Some(d) => d,
+            None => return,
+        };
+
+        let tablename = bind_data.tablename.clone();
+        let database = bind_data.database.clone();
+        let output_location = bind_data.output_location.clone();
+        let workgroup = bind_data.workgroup.clone();
+        let maxrows = bind_data.limit;
+        let predicate = bind_data.predicate.as_deref();
+
+        // Projection pushdown: DuckDB tells us which output columns it actually
+        // needs, in order. Select only those from Athena so columnar formats
+        // scan fewer bytes. Falls back to all columns when nothing is projected.
+        let init = InitInfo::new(info);
+        let projected: Vec<usize> = (0..init.projected_column_count())
+            .map(|i| init.projected_column_index(i))
+            .collect();
+        let select_list = projected_select_list(&bind_data.columns, &projected);
+        // Resolved types of exactly the projected columns, in projection order,
+        // so the scan writes each Athena result column into its matching chunk
+        // vector with the physical layout registered at bind. Empty for
+        // `COUNT(*)` (no columns projected), where the chunk has no vectors.
+        let projected_types: Vec<ColType> = projected
+            .iter()
+            .filter_map(|&i| bind_data.col_types.get(i).copied())
+            .collect();
+
+        let config =
+            crate::RUNTIME.block_on(aws_config::defaults(BehaviorVersion::latest()).load());
+        let client = AthenaClient::new(&config);
+
+        let query = build_athena_query(&select_list, &database, &tablename, predicate, maxrows);
+
+        // Only send a client ResultConfiguration when an explicit
+        // output_location was given. Otherwise Athena applies the workgroup's
+        // own result configuration (location, encryption, ACL, managed results).
+        let mut request = client
+            .start_query_execution()
+            .query_string(query)
+            .work_group(workgroup);
+        if let Some(location) = output_location {
+            request = request.result_configuration(
+                ResultConfiguration::builder()
+                    .output_location(location)
+                    .build(),
+            );
+        }
+
+        let start_resp = crate::RUNTIME.block_on(request.send());
+
+        let query_execution_id = match start_resp {
+            Ok(r) => r.query_execution_id().unwrap_or_default().to_string(),
+            Err(e) => {
+                let msg = CString::new(e.to_string()).unwrap_or_default();
+                libduckdb_sys::duckdb_init_set_error(info, msg.as_ptr());
+                return;
+            }
+        };
+
+        eprintln!("Running Athena query, execution id: {query_execution_id}");
+
+        let poll_start = Instant::now();
+        let mut poll_delay = POLL_INITIAL;
+        loop {
+            let get_resp = crate::RUNTIME.block_on(
+                client
+                    .get_query_execution()
+                    .query_execution_id(query_execution_id.clone())
+                    .send(),
+            );
+
+            let resp = match get_resp {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = CString::new(e.to_string()).unwrap_or_default();
+                    libduckdb_sys::duckdb_init_set_error(info, msg.as_ptr());
+                    return;
+                }
+            };
+
+            let state = match status(&resp) {
+                Some(s) => s,
+                None => {
+                    let msg = CString::new("Could not get query state").unwrap_or_default();
+                    libduckdb_sys::duckdb_init_set_error(info, msg.as_ptr());
+                    return;
+                }
+            };
+
+            match state {
+                Queued | Running => {
+                    if poll_start.elapsed() >= MAX_POLL_WAIT {
+                        // Stop the query so Athena doesn't keep scanning (and
+                        // billing) after we abandon it. Best-effort: we're
+                        // already erroring out, so ignore the stop result.
+                        let _ = crate::RUNTIME.block_on(
+                            client
+                                .stop_query_execution()
+                                .query_execution_id(query_execution_id.clone())
+                                .send(),
+                        );
+                        let msg = format!(
+                            "Athena query {} still {:?} after {}s; aborting",
+                            query_execution_id,
+                            state,
+                            MAX_POLL_WAIT.as_secs()
+                        );
+                        let c_msg = CString::new(msg).unwrap_or_default();
+                        libduckdb_sys::duckdb_init_set_error(info, c_msg.as_ptr());
+                        return;
+                    }
+                    // Deliberately quiet: DuckDB renders its own progress bar
+                    // while the scan runs, and a line per poll scrolls it away.
+                    thread::sleep(poll_delay);
+                    poll_delay = next_poll_delay(poll_delay, POLL_MAX);
+                }
+                Cancelled | Failed => {
+                    let msg = format!("Query {:?}: {}", state, query_execution_id);
+                    let c_msg = CString::new(msg).unwrap_or_default();
+                    libduckdb_sys::duckdb_init_set_error(info, c_msg.as_ptr());
+                    return;
+                }
+                _ => {
+                    print_query_stats(&resp);
+
+                    // Athena has already written the entire result set as one CSV
+                    // object. Streaming it costs a single GetObject; paging the
+                    // same rows through GetQueryResults costs one call per 1000
+                    // rows (~135s for a million), so only fall back to paging when
+                    // there is no readable S3 location.
+                    let mode = match open_result_csv(&config, &resp) {
+                        Ok(Some(rows)) => ScanMode::Csv { rows },
+                        Ok(None) => paged_mode(&client, &query_execution_id),
+                        Err(e) => {
+                            eprintln!("Falling back to GetQueryResults paging: {e}");
+                            paged_mode(&client, &query_execution_id)
+                        }
+                    };
+
+                    FfiInitData::<ScanInitData>::set(
+                        info,
+                        ScanInitData {
+                            mode,
+                            col_types: projected_types,
+                            done: false,
+                        },
+                    );
+                    break;
+                }
+            }
+        }
+    }
+}
+
+pub fn build_table_function_def() -> TableFunctionBuilder {
+    TableFunctionBuilder::new("athena_scan")
+        .param(TypeId::Varchar)
+        .named_param("output_location", TypeId::Varchar)
+        .named_param("workgroup", TypeId::Varchar)
+        .named_param("maxrows", TypeId::Integer)
+        .named_param("database", TypeId::Varchar)
+        .named_param("predicate", TypeId::Varchar)
+        .projection_pushdown(true)
+        .bind(read_athena_bind)
+        .init(read_athena_init)
+        .scan(read_athena)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_athena_query, datum_row_to_result_row, mask_string_literals, next_poll_delay,
+        parse_optional_arg, projected_select_list, qualified_table, result_output_location,
+        result_row_cell, validate_predicate, POLL_INITIAL, POLL_MAX,
+    };
+    use aws_sdk_athena::operation::get_query_execution::GetQueryExecutionOutput;
+    use aws_sdk_athena::types::{Datum, QueryExecution, ResultConfiguration, Row};
+    use std::time::Duration;
+
+    #[test]
+    fn next_poll_delay_doubles_then_caps() {
+        assert_eq!(
+            next_poll_delay(POLL_INITIAL, POLL_MAX),
+            Duration::from_millis(500)
+        );
+        assert_eq!(next_poll_delay(Duration::from_secs(3), POLL_MAX), POLL_MAX); // 6s capped
+        assert_eq!(next_poll_delay(POLL_MAX, POLL_MAX), POLL_MAX); // stays at cap
+    }
+
+    #[test]
+    fn result_row_cell_null_fills_ragged_rows() {
+        // A row with fewer cells than columns must null-fill the trailing
+        // columns rather than leave them unwritten (stale from a prior chunk).
+        let row = vec![Some("a".to_string())];
+        assert_eq!(result_row_cell(&row, 0), Some("a"));
+        assert_eq!(result_row_cell(&row, 1), None);
+    }
+
+    #[test]
+    fn datum_row_keeps_nulls_distinct_from_values() {
+        // A Datum with no var_char_value is Athena's SQL NULL, and must not
+        // collapse into an empty string when the paging fallback converts it.
+        let row = Row::builder()
+            .data(Datum::builder().var_char_value("a").build())
+            .data(Datum::builder().build())
+            .data(Datum::builder().var_char_value("").build())
+            .build();
+        let converted = datum_row_to_result_row(&row);
+        assert_eq!(result_row_cell(&converted, 0), Some("a"));
+        assert_eq!(result_row_cell(&converted, 1), None);
+        assert_eq!(result_row_cell(&converted, 2), Some(""));
+    }
+
+    /// A finished execution carrying the given result location, as Athena
+    /// reports it from GetQueryExecution.
+    fn execution_with_location(location: Option<&str>) -> GetQueryExecutionOutput {
+        let mut rc = ResultConfiguration::builder();
+        if let Some(loc) = location {
+            rc = rc.output_location(loc);
+        }
+        GetQueryExecutionOutput::builder()
+            .query_execution(
+                QueryExecution::builder()
+                    .result_configuration(rc.build())
+                    .build(),
+            )
+            .build()
+    }
+
+    #[test]
+    fn result_location_drives_the_s3_fast_path() {
+        assert_eq!(
+            result_output_location(&execution_with_location(Some("s3://bucket/key.csv"))),
+            Some("s3://bucket/key.csv")
+        );
+    }
+
+    #[test]
+    fn missing_result_location_falls_back_to_paging() {
+        // Athena-managed query results expose no S3 location; the scan must page
+        // GetQueryResults rather than error or read nothing.
+        assert_eq!(result_output_location(&execution_with_location(None)), None);
+        assert_eq!(
+            result_output_location(&execution_with_location(Some(""))),
+            None
+        );
+        assert_eq!(
+            result_output_location(&GetQueryExecutionOutput::builder().build()),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_optional_arg_none_when_omitted() {
+        assert_eq!(parse_optional_arg("output_location", None).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_optional_arg_trims_value() {
+        assert_eq!(
+            parse_optional_arg("workgroup", Some("  analytics  ")).unwrap(),
+            Some("analytics".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_optional_arg_rejects_explicit_empty() {
+        assert!(parse_optional_arg("output_location", Some("")).is_err());
+        assert!(parse_optional_arg("output_location", Some("   ")).is_err());
+    }
+
+    fn cols() -> Vec<String> {
+        ["id", "name", "year"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn qualified_table_quotes_identifiers() {
+        assert_eq!(
+            qualified_table("analytics", "events"),
+            "\"analytics\".\"events\""
+        );
+        assert_eq!(
+            qualified_table("odd\"db", "odd\"table"),
+            "\"odd\"\"db\".\"odd\"\"table\""
+        );
+    }
+
+    #[test]
+    fn build_query_includes_predicate_before_limit() {
+        assert_eq!(
+            build_athena_query("*", "analytics", "events", Some("year = 2024"), 100),
+            "SELECT * FROM \"analytics\".\"events\" WHERE year = 2024 LIMIT 100"
+        );
+    }
+
+    #[test]
+    fn build_query_omits_limit_for_non_positive_limit() {
+        assert_eq!(
+            build_athena_query("*", "analytics", "events", Some("year = 2024"), 0),
+            "SELECT * FROM \"analytics\".\"events\" WHERE year = 2024"
+        );
+    }
+
+    #[test]
+    fn build_query_uses_projected_select_list() {
+        let select = projected_select_list(&cols(), &[0, 2]);
+        assert_eq!(
+            build_athena_query(&select, "analytics", "events", None, 100),
+            "SELECT \"id\", \"year\" FROM \"analytics\".\"events\" LIMIT 100"
+        );
+    }
+
+    #[test]
+    fn projected_select_list_preserves_requested_order() {
+        // DuckDB may request columns in a different order than the schema.
+        assert_eq!(projected_select_list(&cols(), &[2, 0]), "\"year\", \"id\"");
+    }
+
+    #[test]
+    fn projected_select_list_quotes_identifiers() {
+        let columns = vec!["od\"d".to_string()];
+        assert_eq!(projected_select_list(&columns, &[0]), "\"od\"\"d\"");
+    }
+
+    #[test]
+    fn projected_select_list_empty_selects_constant() {
+        // Defensive: DuckDB keeps a placeholder column even for COUNT(*), so it
+        // never projects nothing -- but an empty list would be invalid SQL.
+        assert_eq!(projected_select_list(&cols(), &[]), "1");
+    }
+
+    #[test]
+    fn projected_select_list_ignores_out_of_range_indices() {
+        assert_eq!(projected_select_list(&cols(), &[1, 99]), "\"name\"");
+        // All out of range collapses to the safe constant.
+        assert_eq!(projected_select_list(&cols(), &[99]), "1");
+    }
+
+    #[test]
+    fn validate_predicate_accepts_simple_where_expression() {
+        assert_eq!(
+            validate_predicate(" year = 2024 AND event_type = 'click' ").unwrap(),
+            "year = 2024 AND event_type = 'click'"
+        );
+    }
+
+    #[test]
+    fn validate_predicate_rejects_statement_separators_and_comments() {
+        assert!(validate_predicate("year = 2024; DROP TABLE events").is_err());
+        assert!(validate_predicate("year = 2024 -- comment").is_err());
+        assert!(validate_predicate("year = 2024 /* comment */").is_err());
+    }
+
+    #[test]
+    fn validate_predicate_rejects_full_sql_statements() {
+        assert!(validate_predicate("SELECT * FROM events").is_err());
+        assert!(validate_predicate("year = 2024 DELETE FROM events").is_err());
+    }
+
+    #[test]
+    fn validate_predicate_accepts_keyword_inside_quoted_literal() {
+        // A reserved word inside a string value is data, not SQL syntax.
+        assert_eq!(
+            validate_predicate("name = 'DROP everything'").unwrap(),
+            "name = 'DROP everything'"
+        );
+        assert_eq!(
+            validate_predicate("name = 'it''s a DELETE order'").unwrap(),
+            "name = 'it''s a DELETE order'"
+        );
+    }
+
+    #[test]
+    fn validate_predicate_still_rejects_keyword_outside_literal() {
+        assert!(validate_predicate("name = 'ok' OR DROP TABLE events").is_err());
+    }
+
+    #[test]
+    fn mask_string_literals_blanks_contents_but_keeps_quotes_and_length() {
+        assert_eq!(mask_string_literals("name = 'DROP'"), "name = '    '");
+        // A doubled quote is SQL's escaped quote, not the literal's end, so
+        // everything up to the real closing quote stays masked.
+        assert_eq!(mask_string_literals("'it''s DROP'"), "'          '");
+        assert_eq!(mask_string_literals("no literal here"), "no literal here");
+    }
+}

@@ -1,0 +1,9 @@
+[project]
+name = "project"
+version = "0.1.0"
+description = "DuckDB Python examples for the Athena extension"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "duckdb>=1.5.4",
+]

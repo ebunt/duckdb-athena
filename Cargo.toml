@@ -1,0 +1,25 @@
+[package]
+name = "duckdb-athena"
+version = "0.2.3"
+edition = "2021"
+
+[dependencies]
+quack-rs = "=0.11.0"
+libduckdb-sys = { version = ">=1.4.4, <2", features = ["loadable-extension"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+aws-config = "1"
+aws-sdk-athena = "1"
+aws-sdk-glue = "1"
+time = { version = "0.3", features = ["macros", "parsing"] }
+aws-sdk-s3 = "1"
+
+[lib]
+name = "duckdb_athena"
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
