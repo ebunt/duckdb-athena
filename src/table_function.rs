@@ -57,7 +57,7 @@ type PageFetcher = Box<dyn FnMut() -> Option<Result<GetQueryResultsOutput, Strin
 enum ScanMode {
     /// Stream the single CSV object Athena wrote to S3: one `GetObject` for the
     /// whole result set instead of a `GetQueryResults` round trip per 1000 rows.
-    Csv { rows: CsvRowStream },
+    Csv { rows: Box<CsvRowStream> },
     /// Fallback when the execution exposes no S3 result location (a workgroup
     /// using Athena-managed query results) or S3 is unreadable: page
     /// `GetQueryResults` 1000 rows at a time.
@@ -779,7 +779,8 @@ fn open_result_csv(
     let object = crate::RUNTIME
         .block_on(s3.get_object().bucket(bucket).key(key).send())
         .map_err(|e| format!("reading {location}: {e}"))?;
-    Ok(Some(CsvRowStream::new(object.body)))
+    let content_length = object.content_length().and_then(|n| u64::try_from(n).ok());
+    Ok(Some(CsvRowStream::new(object.body, content_length)))
 }
 
 /// The `GetQueryResults` paging fallback: one page per scan call.
@@ -937,7 +938,9 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
                     // rows (~135s for a million), so only fall back to paging when
                     // there is no readable S3 location.
                     let mode = match open_result_csv(&config, &resp) {
-                        Ok(Some(rows)) => ScanMode::Csv { rows },
+                        Ok(Some(rows)) => ScanMode::Csv {
+                            rows: Box::new(rows),
+                        },
                         Ok(None) => paged_mode(&client, &query_execution_id),
                         Err(e) => {
                             eprintln!("Falling back to GetQueryResults paging: {e}");
