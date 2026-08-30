@@ -120,6 +120,18 @@ impl CsvParser {
 
 /// Pulls rows from the result object, fetching more bytes only when the buffered
 /// rows run out, so peak memory stays near one chunk rather than the whole file.
+/// Fails when the body ended early. A stream cut on a row boundary parses
+/// cleanly and would otherwise return a prefix of the result while reporting
+/// success — silently wrong answers, so this is checked rather than assumed.
+fn check_complete(bytes_read: u64, content_length: Option<u64>) -> Result<(), String> {
+    match content_length {
+        Some(expected) if bytes_read != expected => Err(format!(
+            "Athena result truncated: read {bytes_read} of {expected} bytes"
+        )),
+        _ => Ok(()),
+    }
+}
+
 pub struct CsvRowStream {
     body: ByteStream,
     parser: CsvParser,
@@ -127,16 +139,21 @@ pub struct CsvRowStream {
     eof: bool,
     /// The CSV's first row is Athena's column header, dropped once.
     header_skipped: bool,
+    bytes_read: u64,
+    /// `Content-Length` of the result object, when S3 reported one.
+    content_length: Option<u64>,
 }
 
 impl CsvRowStream {
-    pub fn new(body: ByteStream) -> Self {
+    pub fn new(body: ByteStream, content_length: Option<u64>) -> Self {
         Self {
             body,
             parser: CsvParser::default(),
             pending: VecDeque::new(),
             eof: false,
             header_skipped: false,
+            bytes_read: 0,
+            content_length,
         }
     }
 
@@ -149,8 +166,12 @@ impl CsvRowStream {
                 .block_on(self.body.try_next())
                 .map_err(|e| format!("reading Athena result from S3: {e}"))?
             {
-                Some(chunk) => self.parser.push(&chunk, &mut rows)?,
+                Some(chunk) => {
+                    self.bytes_read += chunk.len() as u64;
+                    self.parser.push(&chunk, &mut rows)?;
+                }
                 None => {
+                    check_complete(self.bytes_read, self.content_length)?;
                     self.parser.finish(&mut rows)?;
                     self.eof = true;
                 }
@@ -169,7 +190,7 @@ impl CsvRowStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_s3_uri, CsvParser, ResultRow};
+    use super::{check_complete, parse_s3_uri, CsvParser, ResultRow};
 
     fn parse(input: &str) -> Vec<ResultRow> {
         let mut parser = CsvParser::default();
@@ -253,6 +274,21 @@ mod tests {
         let mut out = Vec::new();
         parser.push(b"\"h\"\n\"unfinished", &mut out).unwrap();
         assert!(parser.finish(&mut out).is_err());
+    }
+
+    #[test]
+    fn short_read_is_an_error_not_a_partial_result() {
+        // The dangerous case: a stream cut between rows parses cleanly, so
+        // without this the scan would report success on a prefix of the data.
+        assert!(check_complete(4_000_000, Some(4_281_056)).is_err());
+        assert!(check_complete(0, Some(1)).is_err());
+    }
+
+    #[test]
+    fn complete_or_unknown_length_reads_are_accepted() {
+        assert!(check_complete(4_281_056, Some(4_281_056)).is_ok());
+        // S3 not reporting a length must not fail every scan.
+        assert!(check_complete(4_281_056, None).is_ok());
     }
 
     #[test]

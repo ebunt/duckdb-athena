@@ -40,16 +40,25 @@ statement keywords, and every column it names must exist in the Glue schema.
     timestamps, `DECIMAL(10,2)` values `-0.05`/`1234.56`/`0.00`, NULLs preserved
     per column, and an empty string staying empty rather than becoming NULL.
 
-  Neither check is automated, so both can regress silently.
+  Neither check is automated, but `scripts/live-check.sh` now covers the rest:
+  value parity against Athena computing the same aggregates, a full scan
+  completing in seconds rather than paging, `maxrows`/`predicate` reaching
+  Athena, projection pushdown asserted against the SQL Athena actually
+  received, and an unknown predicate column being rejected at bind. Run it
+  before cutting a release; it needs credentials, so CI cannot.
 
-## Unverified assumptions
+## Assumptions, and what backs them
 
 - **One result object per query.** `open_result_csv` reads a single S3 object,
-  the execution's `ResultConfiguration.OutputLocation`. Athena writes ordinary
-  `SELECT` results as one CSV, verified up to 1.07M rows / 4.2 MB, but nothing
-  checks it: if a result were ever split across objects the scan would return a
-  prefix and report success. Hardening options are to compare rows read against
-  the execution statistics, or to list the prefix instead of assuming the key.
+  the execution's `ResultConfiguration.OutputLocation`. Tested at 53,513,100
+  rows (a cross join over nyctaxi), where Athena still wrote exactly one
+  553.7 MiB `<query-id>.csv` plus its `.metadata` sibling — no splitting. The
+  two ways this could go wrong are both handled rather than assumed: a location
+  that is not a readable object makes `GetObject` fail, which logs and falls
+  back to `GetQueryResults` paging, and a stream that ends early now fails
+  loudly because bytes read are checked against the object's `Content-Length`
+  (a cut on a row boundary parses cleanly and would otherwise be reported as a
+  complete, shorter result).
 
 ## Predicate translation design (for the C++ API path)
 

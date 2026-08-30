@@ -37,6 +37,10 @@ LOAD 'target/release/duckdb_athena.duckdb_extension';
 
 `-unsigned` is required because locally compiled extensions lack a release signature. `allow_extensions_metadata_mismatch` is *not* required (verified on DuckDB 1.5.4/1.5.5, CLI and Python): it only bypasses the footer's platform check, which a build stamped for the host platform already passes. Leave it off so a wrong-platform asset fails loudly.
 
+## Live checks
+
+`scripts/live-check.sh [path/to/extension]` runs the extension against real Athena and compares each answer with Athena computing the same thing natively (12 checks; needs credentials, so CI cannot run it). Run it before cutting a release. It asserts on the SQL Athena received where the value alone would not prove anything — projection pushdown being the case in point.
+
 ## Testing
 
 `cargo test --locked` runs the unit tests (query building, type mapping, date/timestamp parsing). There is no automated end-to-end suite; verifying against live Athena requires AWS credentials:
