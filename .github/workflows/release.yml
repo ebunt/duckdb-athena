@@ -91,10 +91,52 @@ jobs:
                   path: dist/duckdb_athena-${{ matrix.platform }}.tar.gz
                   if-no-files-found: error
 
+    smoke:
+        name: Smoke ${{ matrix.platform }}
+        needs: build
+        runs-on: ${{ matrix.runner }}
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - platform: linux_amd64
+                      runner: ubuntu-latest
+                    - platform: osx_arm64
+                      runner: macos-14
+
+        steps:
+            - name: Download build artifact
+              uses: actions/download-artifact@v8
+              with:
+                  name: duckdb_athena-${{ matrix.platform }}
+                  path: dist
+
+            - name: Install DuckDB CLI
+              run: curl -fsSL https://install.duckdb.org | sh
+
+            # Catches the failure mode that shipped in v0.2.0: an asset that
+            # builds and uploads fine but cannot be loaded on its own platform.
+            # No AWS credentials needed -- LOAD alone exercises the footer,
+            # platform stamp and init symbol.
+            - name: Load the packaged extension
+              run: |
+                  tar -xzf "dist/duckdb_athena-${{ matrix.platform }}.tar.gz"
+                  version=$(~/.duckdb/cli/latest/duckdb -unsigned -noheader -list -c "
+                    LOAD '$PWD/duckdb_athena.duckdb_extension';
+                    SELECT extension_version FROM duckdb_extensions()
+                    WHERE extension_name = 'duckdb_athena';
+                  ")
+                  echo "loaded, extension_version=$version"
+                  test -n "$version" || { echo "extension reported no version"; exit 1; }
+                  if [ "${{ github.ref_type }}" = "tag" ]; then
+                    test "$version" = "${{ github.ref_name }}" || {
+                      echo "footer says $version, tag is ${{ github.ref_name }}"; exit 1; }
+                  fi
+
     github-release:
         name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
-        needs: build
+        needs: [build, smoke]
         runs-on: ubuntu-latest
         permissions:
             contents: write
