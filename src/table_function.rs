@@ -519,11 +519,22 @@ fn check_identifier(name: &str, known: &[String], columns: &[String]) -> Result<
 /// `indices` are positions into `columns` (the bind-time output schema), in the
 /// order DuckDB wants them. When empty (e.g. `COUNT(*)`), selects the constant
 /// `1` so Athena scans no column data but still returns one row per source row.
-fn projected_select_list(columns: &[String], indices: &[usize]) -> String {
+///
+/// Complex columns are selected as `CAST(col AS JSON)`: Athena's default
+/// rendering of an array, map or struct is ambiguous (`[a,b, c]` for
+/// `array['a,b', 'c']`), while its JSON rendering escapes properly and keeps
+/// struct field names.
+fn projected_select_list(columns: &[String], col_types: &[ColType], indices: &[usize]) -> String {
     let cols: Vec<String> = indices
         .iter()
-        .filter_map(|&i| columns.get(i))
-        .map(|c| quote_identifier(c))
+        .filter_map(|&i| columns.get(i).map(|c| (i, c)))
+        .map(|(i, c)| {
+            let quoted = quote_identifier(c);
+            match col_types.get(i) {
+                Some(ColType::Json) => format!("CAST({quoted} AS JSON)"),
+                _ => quoted,
+            }
+        })
         .collect();
     if cols.is_empty() {
         "1".to_string()
@@ -696,6 +707,11 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
                 ColType::Decimal { width, scale } => {
                     bi.add_result_column_with_type(name, &LogicalType::decimal(width, scale));
                 }
+                // JSON text is a VARCHAR column to DuckDB; only the Athena-side
+                // SELECT differs.
+                ColType::Json => {
+                    bi.add_result_column(name, TypeId::Varchar);
+                }
                 ColType::Simple(type_id) => {
                     bi.add_result_column(name, type_id);
                 }
@@ -824,7 +840,8 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
         let projected: Vec<usize> = (0..init.projected_column_count())
             .map(|i| init.projected_column_index(i))
             .collect();
-        let select_list = projected_select_list(&bind_data.columns, &projected);
+        let select_list =
+            projected_select_list(&bind_data.columns, &bind_data.col_types, &projected);
         // Resolved types of exactly the projected columns, in projection order,
         // so the scan writes each Athena result column into its matching chunk
         // vector with the physical layout registered at bind. Empty for
@@ -984,8 +1001,10 @@ mod tests {
         parse_optional_arg, projected_select_list, qualified_table, result_output_location,
         result_row_cell, validate_predicate, validate_predicate_columns, POLL_INITIAL, POLL_MAX,
     };
+    use crate::types::ColType;
     use aws_sdk_athena::operation::get_query_execution::GetQueryExecutionOutput;
     use aws_sdk_athena::types::{Datum, QueryExecution, ResultConfiguration, Row};
+    use quack_rs::types::TypeId;
     use std::time::Duration;
 
     #[test]
@@ -1099,6 +1118,11 @@ mod tests {
         );
     }
 
+    /// Resolved types matching `cols()`: all simple, none complex.
+    fn simple_types() -> Vec<ColType> {
+        vec![ColType::Simple(TypeId::Varchar); 3]
+    }
+
     #[test]
     fn build_query_includes_predicate_before_limit() {
         assert_eq!(
@@ -1117,7 +1141,7 @@ mod tests {
 
     #[test]
     fn build_query_uses_projected_select_list() {
-        let select = projected_select_list(&cols(), &[0, 2]);
+        let select = projected_select_list(&cols(), &simple_types(), &[0, 2]);
         assert_eq!(
             build_athena_query(&select, "analytics", "events", None, 100),
             "SELECT \"id\", \"year\" FROM \"analytics\".\"events\" LIMIT 100"
@@ -1125,29 +1149,56 @@ mod tests {
     }
 
     #[test]
+    fn projected_select_list_casts_complex_columns_to_json() {
+        // Athena's default rendering of an array/map/struct is ambiguous, so
+        // complex columns are selected as JSON while the rest are untouched.
+        let columns = vec!["id".to_string(), "tags".to_string()];
+        let types = vec![ColType::Simple(TypeId::BigInt), ColType::Json];
+        assert_eq!(
+            projected_select_list(&columns, &types, &[0, 1]),
+            "\"id\", CAST(\"tags\" AS JSON)"
+        );
+        // Quoting still applies inside the cast.
+        let odd = vec!["od\"d".to_string()];
+        assert_eq!(
+            projected_select_list(&odd, &[ColType::Json], &[0]),
+            "CAST(\"od\"\"d\" AS JSON)"
+        );
+    }
+
+    #[test]
     fn projected_select_list_preserves_requested_order() {
         // DuckDB may request columns in a different order than the schema.
-        assert_eq!(projected_select_list(&cols(), &[2, 0]), "\"year\", \"id\"");
+        assert_eq!(
+            projected_select_list(&cols(), &simple_types(), &[2, 0]),
+            "\"year\", \"id\""
+        );
     }
 
     #[test]
     fn projected_select_list_quotes_identifiers() {
         let columns = vec!["od\"d".to_string()];
-        assert_eq!(projected_select_list(&columns, &[0]), "\"od\"\"d\"");
+        assert_eq!(
+            projected_select_list(&columns, &simple_types(), &[0]),
+            "\"od\"\"d\""
+        );
     }
 
     #[test]
     fn projected_select_list_empty_selects_constant() {
         // Defensive: DuckDB keeps a placeholder column even for COUNT(*), so it
         // never projects nothing -- but an empty list would be invalid SQL.
-        assert_eq!(projected_select_list(&cols(), &[]), "1");
+        assert_eq!(projected_select_list(&cols(), &simple_types(), &[]), "1");
     }
 
     #[test]
     fn projected_select_list_ignores_out_of_range_indices() {
-        assert_eq!(projected_select_list(&cols(), &[1, 99]), "\"name\"");
+        assert_eq!(
+            projected_select_list(&cols(), &simple_types(), &[1, 99]),
+            "\"name\""
+        );
         // All out of range collapses to the safe constant.
-        assert_eq!(projected_select_list(&cols(), &[99]), "1");
+        assert_eq!(projected_select_list(&cols(), &simple_types(), &[99]), "1");
     }
 
     #[test]

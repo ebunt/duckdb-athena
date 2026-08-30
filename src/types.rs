@@ -9,7 +9,17 @@ use quack_rs::{types::TypeId, vector::VectorWriter};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColType {
     Simple(TypeId),
-    Decimal { width: u8, scale: u8 },
+    Decimal {
+        width: u8,
+        scale: u8,
+    },
+    /// A complex Athena type (array, map, struct) selected as `CAST(col AS JSON)`
+    /// and written as `VARCHAR`. Athena's default rendering of these is lossy —
+    /// `array['a,b', 'c']` prints as `[a,b, c]`, where the comma inside the
+    /// element cannot be told from the separator — so the value would be
+    /// unparseable. JSON escapes properly and keeps struct field names, which
+    /// makes DuckDB's json functions usable on the result.
+    Json,
 }
 
 // Maps Athena/Glue data types to DuckDB types.
@@ -34,6 +44,11 @@ pub fn map_type(col_type: &str) -> Result<ColType, String> {
         // values keep numeric typing instead of coming back as strings.
         s if s == "decimal" || s.starts_with("decimal(") => return parse_decimal(s),
         "string" | "varchar" | "char" => TypeId::Varchar,
+        // Complex types are requested as JSON rather than Athena's ambiguous
+        // default text. Glue spells them `array<...>`, `map<...>`, `struct<...>`.
+        s if s.starts_with("array<") || s.starts_with("map<") || s.starts_with("struct<") => {
+            return Ok(ColType::Json)
+        }
         _ => {
             return Err(format!("Unsupported data type: {col_type}"));
         }
@@ -200,6 +215,9 @@ pub unsafe fn populate_column(
                 }
                 return;
             }
+            // JSON arrives as text and is written verbatim; DuckDB's json
+            // functions parse it on demand.
+            ColType::Json => TypeId::Varchar,
             ColType::Simple(type_id) => type_id,
         };
 
@@ -257,6 +275,24 @@ mod tests {
         assert_eq!(
             map_type("timestamp").unwrap(),
             ColType::Simple(TypeId::Timestamp)
+        );
+    }
+
+    #[test]
+    fn map_type_flags_complex_types_as_json() {
+        // These are read as CAST(col AS JSON); Athena's plain text rendering of
+        // them cannot be parsed back (`array['a,b','c']` prints as `[a,b, c]`).
+        assert_eq!(map_type("array<string>").unwrap(), ColType::Json);
+        assert_eq!(map_type("map<string,int>").unwrap(), ColType::Json);
+        assert_eq!(map_type("struct<a:int,b:string>").unwrap(), ColType::Json);
+        assert_eq!(
+            map_type("array<struct<a:int,b:array<string>>>").unwrap(),
+            ColType::Json
+        );
+        // Not complex: a plain string column keeps its own mapping.
+        assert_eq!(
+            map_type("string").unwrap(),
+            ColType::Simple(TypeId::Varchar)
         );
     }
 

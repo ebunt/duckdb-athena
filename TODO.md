@@ -12,6 +12,16 @@ query results. Column projection is pushed into Athena; filtering with
 return. A `predicate=` is checked at bind: no statement separators, comments or
 statement keywords, and every column it names must exist in the Glue schema.
 
+## Not done
+
+- **Native `LIST`/`STRUCT`/`MAP` for complex columns.** They currently arrive as
+  JSON text (`CAST(col AS JSON)`), which is queryable via DuckDB's json
+  functions. Going native needs a recursive parser for Glue type strings, the
+  nested logical-type constructors, and writing nested vectors through raw FFI
+  (`duckdb_list_vector_reserve`/`set_size`/`get_child`, `duckdb_struct_vector_get_child`;
+  quack-rs wraps none of these, and DuckDB's `MAP` is a `LIST` of
+  `STRUCT(key, value)` underneath). Roughly a week, most of it unsafe code.
+
 ## Blocked
 
 - **Optimizer-driven filter pushdown.** `libduckdb-sys` exposes projection
