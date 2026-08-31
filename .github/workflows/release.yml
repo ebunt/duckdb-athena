@@ -47,8 +47,14 @@ jobs:
                 include:
                     - platform: linux_amd64
                       runner: ubuntu-latest
+                      # The image duckdb/community-extensions builds linux_amd64
+                      # in (extension-ci-tools/docker/linux_amd64): glibc 2.28.
+                      container: quay.io/pypa/manylinux_2_28_x86_64
                     - platform: osx_arm64
                       runner: macos-14
+                      container: ''
+
+        container: ${{ matrix.container }}
 
         steps:
             - uses: actions/checkout@v5
@@ -56,10 +62,27 @@ jobs:
                   submodules: recursive
 
             - name: Install Rust toolchain
+              if: matrix.container == ''
               uses: dtolnay/rust-toolchain@stable
 
+            # Building on the runner links against whatever glibc
+            # ubuntu-latest ships -- 2.39 today -- and the result then fails to
+            # load on Amazon Linux 2023 (2.34), RHEL 9 (2.34), Debian 12 (2.36)
+            # or Ubuntu 22.04 (2.35). glibc is backward compatible, so an older
+            # baseline runs everywhere newer. The manylinux image already
+            # carries git (checkout needs it before this step runs), make, gcc
+            # and python3, so only Rust has to be added -- the same toolchain
+            # community-extensions installs. macOS has no equivalent problem and
+            # builds on the runner.
+            - name: Prepare container toolchain
+              if: matrix.container != ''
+              run: |
+                  curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+                  echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+                  git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
             # The same targets duckdb/community-extensions runs, so this pipeline
-            # and that one build the extension identically.  also
+            # and that one build the extension identically. `make release` also
             # appends the metadata footer and leaves the packaged extension at
             # build/release/extension/athena/.
             - name: Build release extension
@@ -70,6 +93,21 @@ jobs:
                   export EXTENSION_VERSION="${EXTENSION_VERSION:0:31}"
                   make configure
                   make release
+
+            # CI cannot boot another distro, but it can read what the binary
+            # demands. This is the check that would have caught v0.3.0's asset,
+            # which required GLIBC_2.39 and loaded nowhere but Ubuntu 24.04.
+            # Keep the baseline in step with the container above.
+            - name: Assert the glibc baseline
+              if: matrix.platform == 'linux_amd64'
+              run: |
+                  max=$(strings build/release/extension/athena/athena.duckdb_extension \
+                        | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+                  echo "highest glibc symbol required: $max"
+                  if [ "$(printf '%s\n' "$max" "GLIBC_2.28" | sort -V | tail -1)" != "GLIBC_2.28" ]; then
+                    echo "$max exceeds the 2.28 baseline: will not load on Amazon Linux 2023, RHEL 9 or Debian 12"
+                    exit 1
+                  fi
 
             - name: Package extension
               run: |
