@@ -1,67 +1,41 @@
-# Determine the OS and set the library extension and prefix accordingly
-OS := $(shell uname -s)
-ARCH := $(shell uname -m)
+# Builds the extension through DuckDB's own C-API extension makefiles, which is
+# what duckdb/community-extensions runs: `make release` must leave the packaged
+# extension at build/release/extension/$(EXTENSION_NAME)/.
+#
+# Those makefiles also append the metadata footer (platform, version, ABI), so
+# nothing here does that by hand.
+.PHONY: clean clean_all
 
-ifeq ($(OS),Darwin)
-	EXT = dylib
-	PREFIX = lib
-	PLATFORM_OS = osx
-else ifeq ($(OS),Linux)
-	EXT = so
-	PREFIX = lib
-	PLATFORM_OS = linux
-else
-	# Assume Windows
-	EXT = dll
-	PREFIX =
-	PLATFORM_OS = windows
-	EXE = .exe
-endif
+PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-ifneq ($(filter arm64 aarch64,$(ARCH)),)
-	PLATFORM_ARCH = arm64
-else
-	PLATFORM_ARCH = amd64
-endif
+# Also the name of the cdylib and of the init symbol: DuckDB derives
+# athena_init_c_api from it, so src/lib.rs must match.
+EXTENSION_NAME=athena
+# ?= so the environment wins: a plain make stamps the crate version, while
+# release.yml passes the tag name (or the commit sha off a tag). A plain `=`
+# here would override the environment, which is the opposite of what Make
+# does for command-line variables and quietly loses build provenance.
+EXTENSION_VERSION ?= $(shell awk -F'"' '/^version = /{print "v"$$2; exit}' Cargo.toml)
 
-LIB_NAME = duckdb_athena
-TARGET_DIR = target/release
-BUILT_LIB = $(TARGET_DIR)/$(PREFIX)$(LIB_NAME).$(EXT)
-EXTENSION = $(TARGET_DIR)/$(LIB_NAME).duckdb_extension
-QUACK_RS_VERSION = 0.11.0
-APPEND_METADATA = target/tools/quack-rs-$(QUACK_RS_VERSION)/bin/append_metadata$(EXE)
-DUCKDB_ABI_TYPE ?= C_STRUCT
-DUCKDB_CAPI_VERSION ?= v1.2.0
-# Footer version reported by duckdb_extensions(). Derived from the crate version
-# (which tracks the release tag) so a local build never claims a stale one;
-# release.yml overrides it from the environment with the tag name.
-CRATE_VERSION = $(shell awk -F'"' '/^version = /{print $$2; exit}' Cargo.toml)
-DUCKDB_EXTENSION_VERSION ?= v$(CRATE_VERSION)
-DUCKDB_PLATFORM ?= $(PLATFORM_OS)_$(PLATFORM_ARCH)
+# The C API version this is built against, not the DuckDB version it runs on.
+# Deliberately no USE_UNSTABLE_C_API: quack-rs targets the stable C_STRUCT ABI,
+# so one build loads across DuckDB 1.x. The official Rust template sets that
+# flag only because duckdb-rs needs unstable C API functions.
+TARGET_DUCKDB_VERSION=v1.2.0
 
-.PHONY: all build clean metadata-tool package
+all: configure release
 
-all: build
+include extension-ci-tools/makefiles/c_api_extensions/base.Makefile
+include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 
-build:
-	cargo build --release
-	$(MAKE) package
-	@echo "Extension ready: $(EXTENSION)"
+configure: venv platform extension_version
 
-metadata-tool: $(APPEND_METADATA)
+debug: build_extension_library_debug build_extension_with_metadata_debug
+release: build_extension_library_release build_extension_with_metadata_release
 
-$(APPEND_METADATA):
-	cargo install --locked --root target/tools/quack-rs-$(QUACK_RS_VERSION) \
-		--version $(QUACK_RS_VERSION) quack-rs --bin append_metadata
+test: test_release
+test_debug: test_extension_debug
+test_release: test_extension_release
 
-package: $(APPEND_METADATA)
-	@test -n "$(DUCKDB_EXTENSION_VERSION)" -a "$(DUCKDB_EXTENSION_VERSION)" != "v" \
-		|| { echo "could not read version from Cargo.toml; set DUCKDB_EXTENSION_VERSION"; exit 1; }
-	$(APPEND_METADATA) "$(BUILT_LIB)" "$(EXTENSION)" \
-		--abi-type "$(DUCKDB_ABI_TYPE)" \
-		--extension-version "$(DUCKDB_EXTENSION_VERSION)" \
-		--duckdb-version "$(DUCKDB_CAPI_VERSION)" \
-		--platform "$(DUCKDB_PLATFORM)"
-
-clean:
-	cargo clean
+clean: clean_build clean_rust
+clean_all: clean_configure clean

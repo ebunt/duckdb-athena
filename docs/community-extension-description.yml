@@ -1,0 +1,63 @@
+# Submission descriptor for duckdb/community-extensions.
+#
+# Copy to extensions/athena/description.yml in a fork of that repo, with `ref`
+# pinned to the commit being submitted, and open a PR. Their CI runs
+# `make configure && make release` in a container and expects the packaged
+# extension at build/release/extension/athena/athena.duckdb_extension, which is
+# what this repo's Makefile produces.
+extension:
+  name: athena
+  description: Query AWS Athena tables from DuckDB
+  version: 0.2.5
+  language: Rust
+  build: cargo
+  license: MIT
+  # WASM cannot run this: it needs the AWS SDK and outbound network access.
+  # musl and the Windows MinGW/rtools toolchains are untested here rather than
+  # known-broken, so they are excluded until someone verifies them.
+  excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads;linux_amd64_musl;windows_amd64_mingw;windows_amd64_rtools"
+  requires_toolchains: "rust"
+  maintainers:
+    - ebunt
+
+repo:
+  github: ebunt/duckdb-athena
+  ref: PIN_TO_THE_SUBMITTED_COMMIT
+
+docs:
+  hello_world: |
+    -- Reads the Glue schema, runs the query in Athena, and streams the result
+    -- back from S3. Credentials come from the usual AWS chain.
+    SELECT COUNT(*) FROM athena_scan('my_table');
+
+    -- A different Glue database, and a cap on rows fetched
+    SELECT * FROM athena_scan('my_table', database='my_db', maxrows=100);
+
+    -- Push a filter into Athena so it scans less data (and costs less)
+    SELECT * FROM athena_scan('events', predicate='year = 2024');
+  extended_description: |
+    `athena_scan` exposes an AWS Athena table as a DuckDB table function.
+
+    The schema comes from the Glue catalog, the query runs in Athena, and the
+    result is streamed from the CSV Athena writes to S3 in a single `GetObject`
+    rather than paged 1000 rows at a time — a million-row table comes back in
+    seconds. Workgroups using Athena-managed query results expose no S3
+    location, and those fall back to `GetQueryResults` paging.
+
+    - **Projection pushdown** is automatic: only the columns your query
+      references are selected from Athena, which reduces bytes scanned on
+      Parquet and ORC.
+    - **Filter pushdown** is manual via `predicate=`, because the DuckDB C
+      extension API does not expose table filters
+      ([duckdb/duckdb#25163](https://github.com/duckdb/duckdb/issues/25163)).
+      On partitioned tables a partition predicate prunes as you would expect.
+    - **Types**: `DATE`, `TIMESTAMP` and `DECIMAL(p,s)` map natively. Complex
+      columns (`array`, `map`, `struct`) are read as JSON, so DuckDB's json
+      functions work on them.
+
+    Named parameters: `database`, `maxrows`, `predicate`, `workgroup`,
+    `output_location`.
+
+    Required IAM: `athena:StartQueryExecution`, `athena:GetQueryExecution`,
+    `athena:GetQueryResults`, `glue:GetTable`, and `s3:GetObject`/`s3:PutObject`
+    on the workgroup's results bucket.

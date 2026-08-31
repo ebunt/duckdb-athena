@@ -1,4 +1,4 @@
-"""Run the QUERIES.md examples against Athena via the duckdb_athena extension.
+"""Run the QUERIES.md examples against Athena via the athena extension.
 
 Usage (from repo root):
     uv run --project project python project/athena_examples.py --list
@@ -6,8 +6,8 @@ Usage (from repo root):
     uv run --project project python project/athena_examples.py all
 
 Requires:
-    - The extension built at ../target/release/duckdb_athena.duckdb_extension
-      (run `make` in the repo root), or set ATHENA_EXTENSION_PATH.
+    - The extension built at ../build/release/extension/athena/athena.duckdb_extension
+      (run `make release` in the repo root), or set ATHENA_EXTENSION_PATH.
     - AWS credentials with Athena/Glue/S3 access and a region (AWS_REGION, or a
       profile in ~/.aws/config). The queries hit live Athena and cost money.
 """
@@ -23,7 +23,7 @@ from pathlib import Path
 import duckdb
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_EXT = REPO_ROOT / "target" / "release" / "duckdb_athena.duckdb_extension"
+DEFAULT_EXT = REPO_ROOT / "build" / "release" / "extension" / "athena" / "athena.duckdb_extension"
 
 # Optional explicit Athena results location. When unset, athena_scan uses the
 # workgroup's default result configuration, so the queries below only add
@@ -109,7 +109,7 @@ def connect(ext_path: Path) -> duckdb.DuckDBPyConnection:
     if not ext_path.exists():
         sys.exit(
             f"Extension not found at {ext_path}\n"
-            "Build it with `make` in the repo root, or set ATHENA_EXTENSION_PATH."
+            "Build it with `make release` in the repo root, or set ATHENA_EXTENSION_PATH."
         )
     # allow_unsigned_extensions + metadata mismatch: locally compiled extensions
     # lack the signature/metadata DuckDB expects from official releases.

@@ -4,20 +4,42 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build
 
-Always use `make` rather than `cargo build --release` directly — the Makefile handles compilation, the required `.duckdb_extension` rename, and appending the DuckDB extension footer:
+The build goes through DuckDB's own C-API extension makefiles, vendored as the
+`extension-ci-tools` submodule, because that is exactly what
+`duckdb/community-extensions` runs. Clone with `--recurse-submodules`, or run
+`git submodule update --init` once.
 
 ```bash
-make        # cargo build --release + copy to target/release/duckdb_athena.duckdb_extension + append footer
-make clean  # cargo clean
+make configure   # one-off: python venv + platform/version detection under configure/
+make release     # cargo build --release, footer appended, packaged
+make clean       # cargo clean + build/
 ```
 
-DuckDB 1.0+ only loads files ending in `.duckdb_extension`, and requires a metadata footer (platform, extension version, ABI) appended to the binary. The Makefile installs the pinned quack-rs `append_metadata` binary under `target/tools` and uses it to package the platform-specific output (`libduckdb_athena.dylib` on macOS, `.so` on Linux, `.dll` on Windows).
+`make release` leaves the loadable extension at
+`build/release/extension/athena/athena.duckdb_extension`.
 
-The footer's extension version — what `duckdb_extensions().extension_version` reports — defaults to the `Cargo.toml` version (`v0.2.2`), so a local build reports what it is; `release.yml` overrides `DUCKDB_EXTENSION_VERSION` in the environment with the tag name. Keep the crate version in step with the tag when releasing.
+DuckDB 1.0+ only loads files ending in `.duckdb_extension`, and requires a
+metadata footer (platform, extension version, ABI). `base.Makefile` appends it
+via `append_extension_metadata.py`; nothing in this repo does that by hand.
+
+Three names must agree, or DuckDB loads the file and finds no entry point:
+`EXTENSION_NAME` in the Makefile, `[lib] name` in `Cargo.toml`, and the symbol
+passed to `entry_point!` in `src/lib.rs` — DuckDB derives `athena_init_c_api`
+from the file name. Renaming the extension means changing all three.
+
+The footer's extension version — what `duckdb_extensions().extension_version`
+reports — is derived from the `Cargo.toml` version, so a local build reports
+what it is; `release.yml` passes `EXTENSION_VERSION` with the tag name. Keep the
+crate version in step with the tag when releasing.
+
+Deliberately *not* set: `USE_UNSTABLE_C_API`. quack-rs targets the stable
+`C_STRUCT` ABI, so one build loads across DuckDB 1.x. The official Rust template
+sets that flag only because duckdb-rs needs unstable C API functions, which pins
+those extensions to a single DuckDB version.
 
 ## Lint & format
 
-CI (`.github/workflows/release.yml`) runs `cargo fmt --check`, `cargo clippy` and `cargo test --locked` before building release binaries for 2 platforms (linux amd64, macOS arm64). Each is published as a `duckdb_athena-<platform>.tar.gz` containing `duckdb_athena.duckdb_extension` — the file name must stay exactly that, since DuckDB derives the init symbol (`duckdb_athena_init_c_api`) from it. Run the same locally before pushing:
+CI (`.github/workflows/release.yml`) runs `cargo fmt --check`, `cargo clippy` and `cargo test --locked` before building release binaries for 2 platforms (linux amd64, macOS arm64). Each is published as a `athena-<platform>.tar.gz` containing `athena.duckdb_extension` — the file name must stay exactly that, since DuckDB derives the init symbol (`athena_init_c_api`) from it. Run the same locally before pushing:
 
 ```bash
 cargo fmt --check
@@ -32,7 +54,7 @@ AWS_REGION=us-east-1 duckdb -unsigned
 ```
 
 ```sql
-LOAD 'target/release/duckdb_athena.duckdb_extension';
+LOAD 'build/release/extension/athena/athena.duckdb_extension';
 ```
 
 `-unsigned` is required because locally compiled extensions lack a release signature. `allow_extensions_metadata_mismatch` is *not* required (verified on DuckDB 1.5.4/1.5.5, CLI and Python): it only bypasses the footer's platform check, which a build stamped for the host platform already passes. Leave it off so a wrong-platform asset fails loudly.

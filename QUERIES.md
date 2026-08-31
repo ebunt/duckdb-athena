@@ -11,7 +11,7 @@ different workgroup's default.
 Load the extension first (see README for the `-unsigned` flags):
 
 ```sql
-LOAD 'target/release/duckdb_athena.duckdb_extension';
+LOAD 'build/release/extension/athena/athena.duckdb_extension';
 ```
 
 Signature: `athena_scan('table', database=..., output_location=..., workgroup=..., maxrows=..., predicate=...)`.

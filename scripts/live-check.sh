@@ -11,14 +11,14 @@
 # checks that can assert on the SQL Athena received do.
 #
 # Usage:
-#   scripts/live-check.sh [path/to/duckdb_athena.duckdb_extension]
+#   scripts/live-check.sh [path/to/athena.duckdb_extension]
 #
 # Requires: AWS credentials, duckdb and aws CLIs, and read access to the
 # sampledb and nyctaxi databases in us-east-1.
 
 set -uo pipefail
 
-EXTENSION="${1:-target/release/duckdb_athena.duckdb_extension}"
+EXTENSION="${1:-build/release/extension/athena/athena.duckdb_extension}"
 export AWS_REGION="${AWS_REGION:-us-east-1}"
 WORKGROUP="${ATHENA_WORKGROUP:-primary}"
 
