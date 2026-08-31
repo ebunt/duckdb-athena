@@ -196,6 +196,29 @@ else
 fi
 
 echo
+echo "-- region= and result reuse"
+# region= must beat the ambient region, so run with a deliberately wrong
+# AWS_REGION and let the parameter correct it.
+check "region= overrides AWS_REGION" \
+    "$(athena "SELECT CAST(COUNT(*) AS VARCHAR) FROM sampledb.elb_logs")" \
+    "$(AWS_REGION=eu-west-1 duckdb -unsigned -noheader -list -c "LOAD '$EXTENSION';
+        SELECT COUNT(*) FROM athena_scan('elb_logs', database='sampledb', region='$AWS_REGION');" 2>/dev/null)"
+
+# Reuse is only observable in the execution record: the answer is identical
+# either way, so assert on ReusedPreviousResult and bytes scanned instead.
+reuse_run() {
+    duck "SELECT COUNT(url) FROM athena_scan('elb_logs', database='sampledb', result_reuse_minutes=60);" > /dev/null
+    aws athena get-query-execution --query-execution-id \
+        "$(aws athena list-query-executions --work-group "$WORKGROUP" --max-items 1 \
+            --query 'QueryExecutionIds[0]' --output text | head -1)" \
+        --query 'QueryExecution.Statistics.[ResultReuseInformation.ReusedPreviousResult,DataScannedInBytes]' \
+        --output text
+}
+reuse_run > /dev/null            # prime the cache; this run may or may not reuse
+second=$(reuse_run)
+check "second identical query is reused" "True	0" "$second"
+
+echo
 echo "-- predicate validation rejects unknown columns at bind"
 if duckdb -unsigned -c "LOAD '$EXTENSION';
     SELECT 1 FROM athena_scan('elb_logs', database='sampledb', predicate='nosuchcol = 1');" \

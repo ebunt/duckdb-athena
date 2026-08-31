@@ -1,10 +1,11 @@
 use aws_config::BehaviorVersion;
+use aws_config::Region;
 use aws_sdk_athena::{
     operation::get_query_execution::GetQueryExecutionOutput,
     operation::get_query_results::GetQueryResultsOutput,
     types::{
         QueryExecutionState::{self, *},
-        ResultConfiguration, Row,
+        ResultConfiguration, ResultReuseByAgeConfiguration, ResultReuseConfiguration, Row,
     },
     Client as AthenaClient,
 };
@@ -33,6 +34,15 @@ struct ScanBindData {
     /// workgroup's own result configuration.
     output_location: Option<String>,
     workgroup: String,
+    /// AWS config for this scan, resolved once at bind (honouring `region=`)
+    /// and reused by init. Scoped to the scan: a long-lived process that
+    /// changes `AWS_PROFILE` between queries must see the new profile.
+    config: aws_config::SdkConfig,
+    /// How long to wait for the Athena query to reach a terminal state.
+    timeout: Duration,
+    /// Minutes Athena may reuse a previous identical query's result for, or
+    /// `None` to always re-run. Reused results scan no data and cost nothing.
+    result_reuse_minutes: Option<i32>,
     limit: i32,
     predicate: Option<String>,
     /// Output column names in the order registered with DuckDB: data columns
@@ -223,12 +233,22 @@ pub fn rows_to_duckdb_data_chunk(
 const POLL_INITIAL: Duration = Duration::from_millis(250);
 /// Ceiling for the poll backoff, so long queries still poll at least this often.
 const POLL_MAX: Duration = Duration::from_secs(5);
-/// Backstop so a query that never resolves can't hang DuckDB forever. Athena's
-/// own DML timeout (default 30 min) normally fails a stuck query first; this
-/// only catches genuine indefinite hangs.
-// ponytail: fixed 60-min ceiling; promote to a `timeout=` param if a workgroup
-// raises Athena's own query limit past this.
-const MAX_POLL_WAIT: Duration = Duration::from_secs(60 * 60);
+/// Default backstop so a query that never resolves can't hang DuckDB forever.
+/// Athena's own DML timeout (default 30 min) normally fails a stuck query first;
+/// this only catches genuine indefinite hangs. Override per scan with
+/// `timeout_seconds=`, either to wait longer than a workgroup's raised limit or
+/// to fail fast.
+const DEFAULT_POLL_WAIT: Duration = Duration::from_secs(60 * 60);
+
+/// Athena will not reuse a result older than 7 days.
+const MAX_RESULT_REUSE_MINUTES: i32 = 7 * 24 * 60;
+
+/// How long to sleep before the next state check: the backoff, but never past
+/// the deadline. Without the clamp a 5s backoff can overshoot a short timeout by
+/// almost 5s, so `timeout_seconds` would not bound the wait it promises to.
+fn sleep_before_next_poll(poll_delay: Duration, elapsed: Duration, timeout: Duration) -> Duration {
+    poll_delay.min(timeout.saturating_sub(elapsed))
+}
 
 /// Next poll delay: exponential backoff doubling up to `cap`.
 fn next_poll_delay(current: Duration, cap: Duration) -> Duration {
@@ -543,6 +563,29 @@ fn projected_select_list(columns: &[String], col_types: &[ColType], indices: &[u
     }
 }
 
+/// A scan deadline in seconds. Zero or negative would either busy-wait or abort
+/// instantly, and both are more likely typos than intent.
+fn parse_timeout_seconds(seconds: i32) -> Result<Duration, String> {
+    if seconds > 0 {
+        Ok(Duration::from_secs(seconds as u64))
+    } else {
+        Err(format!("timeout_seconds must be > 0, got {seconds}"))
+    }
+}
+
+/// Result-reuse window in minutes. Athena rejects anything past 7 days, so catch
+/// it here with a message that explains the limit rather than passing it on.
+fn parse_reuse_minutes(minutes: i32) -> Result<i32, String> {
+    if minutes > 0 && minutes <= MAX_RESULT_REUSE_MINUTES {
+        Ok(minutes)
+    } else {
+        Err(format!(
+            "result_reuse_minutes must be between 1 and {MAX_RESULT_REUSE_MINUTES} \
+             (Athena's 7-day limit), got {minutes}"
+        ))
+    }
+}
+
 /// Normalizes an optional string argument: `None` means the parameter was
 /// omitted; an explicitly provided empty/whitespace value is an error rather
 /// than a silent fallback to a default.
@@ -649,6 +692,37 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
         } else {
             maxrows_val.as_i32()
         };
+
+        // Positive integer, in seconds, or the default ceiling. A query still
+        // running when this elapses is stopped rather than abandoned, so the
+        // parameter bounds cost as well as waiting.
+        let timeout_val = bi.get_named_parameter_value("timeout_seconds");
+        let timeout = if timeout_val.is_null() {
+            DEFAULT_POLL_WAIT
+        } else {
+            match parse_timeout_seconds(timeout_val.as_i32()) {
+                Ok(d) => d,
+                Err(e) => {
+                    bi.set_error(&e);
+                    return;
+                }
+            }
+        };
+
+        // Athena caps result reuse at 7 days; anything longer is a user error
+        // rather than something to silently clamp.
+        let reuse_val = bi.get_named_parameter_value("result_reuse_minutes");
+        let result_reuse_minutes = if reuse_val.is_null() {
+            None
+        } else {
+            match parse_reuse_minutes(reuse_val.as_i32()) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    bi.set_error(&e);
+                    return;
+                }
+            }
+        };
         // Database defaults to `default` when omitted; an explicitly empty or
         // wrong-type value is an error, not a silent fallback.
         let Ok(database_raw) = named_str("database") else {
@@ -661,6 +735,19 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
                 return;
             }
         };
+        // Overrides the region the AWS config chain would pick, so one session
+        // can read tables in more than one region.
+        let Ok(region_raw) = named_str("region") else {
+            return;
+        };
+        let region = match parse_optional_arg("region", region_raw.as_deref()) {
+            Ok(v) => v,
+            Err(e) => {
+                bi.set_error(&e);
+                return;
+            }
+        };
+
         let predicate = {
             let predicate_val = bi.get_named_parameter_value("predicate");
             if predicate_val.is_null() {
@@ -683,8 +770,7 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
             }
         };
 
-        let config =
-            crate::RUNTIME.block_on(aws_config::defaults(BehaviorVersion::latest()).load());
+        let config = load_aws_config(region.as_deref());
         let client = GlueClient::new(&config);
 
         let table_result = crate::RUNTIME.block_on(
@@ -735,14 +821,20 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
                 }
             }
             Err(err) => {
-                bi.set_error(&err.into_service_error().to_string());
+                // Glue's own message is often just "Entity Not Found", which
+                // says nothing about what was looked up. Name the table, the
+                // database and the region, since a wrong region looks exactly
+                // like a missing table.
+                let where_ = describe_target(&database, &tablename, region.as_deref(), &config);
+                bi.set_error(&format!("{}: {}", where_, err.into_service_error()));
                 return;
             }
         }
 
         if columns.is_empty() {
             bi.set_error(&format!(
-                "table \"{database}\".\"{tablename}\" has no columns in the Glue catalog"
+                "{} has no columns in the Glue catalog",
+                describe_target(&database, &tablename, region.as_deref(), &config)
             ));
             return;
         }
@@ -765,11 +857,41 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
                 workgroup,
                 limit: maxrows,
                 predicate,
+                config: config.clone(),
+                timeout,
+                result_reuse_minutes,
                 columns,
                 col_types,
             },
         );
     }
+}
+
+/// Names what a failed lookup was actually looking for. A wrong region and a
+/// missing table produce the same Glue error, so the region is always shown.
+fn describe_target(
+    database: &str,
+    tablename: &str,
+    region: Option<&str>,
+    config: &aws_config::SdkConfig,
+) -> String {
+    let region = region
+        .map(str::to_owned)
+        .or_else(|| config.region().map(|r| r.to_string()))
+        .unwrap_or_else(|| "<no region configured>".to_string());
+    format!("table \"{database}\".\"{tablename}\" in region {region}")
+}
+
+/// Resolves AWS config for one scan. Bind loads it and init reuses it through
+/// the bind data, so credentials and region resolve once per scan rather than
+/// twice — but never across scans: a long-lived process that changes
+/// `AWS_PROFILE` between queries must see the new profile, not a cached one.
+fn load_aws_config(region: Option<&str>) -> aws_config::SdkConfig {
+    let mut loader = aws_config::defaults(BehaviorVersion::latest());
+    if let Some(region) = region {
+        loader = loader.region(Region::new(region.to_owned()));
+    }
+    crate::RUNTIME.block_on(loader.load())
 }
 
 /// S3 location of a finished query's result file, or `None` when the execution
@@ -832,6 +954,8 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
         let workgroup = bind_data.workgroup.clone();
         let maxrows = bind_data.limit;
         let predicate = bind_data.predicate.as_deref();
+        let timeout = bind_data.timeout;
+        let result_reuse_minutes = bind_data.result_reuse_minutes;
 
         // Projection pushdown: DuckDB tells us which output columns it actually
         // needs, in order. Select only those from Athena so columnar formats
@@ -851,8 +975,9 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
             .filter_map(|&i| bind_data.col_types.get(i).copied())
             .collect();
 
-        let config =
-            crate::RUNTIME.block_on(aws_config::defaults(BehaviorVersion::latest()).load());
+        // Loaded at bind for this scan; reusing it here avoids resolving
+        // credentials a second time without outliving the scan.
+        let config = bind_data.config.clone();
         let client = AthenaClient::new(&config);
 
         let query = build_athena_query(&select_list, &database, &tablename, predicate, maxrows);
@@ -863,11 +988,25 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
         let mut request = client
             .start_query_execution()
             .query_string(query)
-            .work_group(workgroup);
+            .work_group(workgroup.clone());
         if let Some(location) = output_location {
             request = request.result_configuration(
                 ResultConfiguration::builder()
                     .output_location(location)
+                    .build(),
+            );
+        }
+        // Opt-in: Athena returns a previous identical query's result if it is
+        // younger than this, scanning no data and charging nothing.
+        if let Some(minutes) = result_reuse_minutes {
+            request = request.result_reuse_configuration(
+                ResultReuseConfiguration::builder()
+                    .result_reuse_by_age_configuration(
+                        ResultReuseByAgeConfiguration::builder()
+                            .enabled(true)
+                            .max_age_in_minutes(minutes)
+                            .build(),
+                    )
                     .build(),
             );
         }
@@ -877,7 +1016,13 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
         let query_execution_id = match start_resp {
             Ok(r) => r.query_execution_id().unwrap_or_default().to_string(),
             Err(e) => {
-                let msg = CString::new(e.to_string()).unwrap_or_default();
+                // Include the workgroup: the usual cause is a workgroup with no
+                // result configuration and no output_location given, and the
+                // raw message does not say which workgroup was used.
+                let msg = CString::new(format!(
+                    "starting Athena query in workgroup \"{workgroup}\": {e}"
+                ))
+                .unwrap_or_default();
                 libduckdb_sys::duckdb_init_set_error(info, msg.as_ptr());
                 return;
             }
@@ -915,7 +1060,7 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
 
             match state {
                 Queued | Running => {
-                    if poll_start.elapsed() >= MAX_POLL_WAIT {
+                    if poll_start.elapsed() >= timeout {
                         // Stop the query so Athena doesn't keep scanning (and
                         // billing) after we abandon it. Best-effort: we're
                         // already erroring out, so ignore the stop result.
@@ -929,7 +1074,7 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
                             "Athena query {} still {:?} after {}s; aborting",
                             query_execution_id,
                             state,
-                            MAX_POLL_WAIT.as_secs()
+                            timeout.as_secs()
                         );
                         let c_msg = CString::new(msg).unwrap_or_default();
                         libduckdb_sys::duckdb_init_set_error(info, c_msg.as_ptr());
@@ -937,7 +1082,11 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
                     }
                     // Deliberately quiet: DuckDB renders its own progress bar
                     // while the scan runs, and a line per poll scrolls it away.
-                    thread::sleep(poll_delay);
+                    thread::sleep(sleep_before_next_poll(
+                        poll_delay,
+                        poll_start.elapsed(),
+                        timeout,
+                    ));
                     poll_delay = next_poll_delay(poll_delay, POLL_MAX);
                 }
                 Cancelled | Failed => {
@@ -988,6 +1137,9 @@ pub fn build_table_function_def() -> TableFunctionBuilder {
         .named_param("maxrows", TypeId::Integer)
         .named_param("database", TypeId::Varchar)
         .named_param("predicate", TypeId::Varchar)
+        .named_param("region", TypeId::Varchar)
+        .named_param("timeout_seconds", TypeId::Integer)
+        .named_param("result_reuse_minutes", TypeId::Integer)
         .projection_pushdown(true)
         .bind(read_athena_bind)
         .init(read_athena_init)
@@ -997,9 +1149,11 @@ pub fn build_table_function_def() -> TableFunctionBuilder {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_athena_query, datum_row_to_result_row, mask_string_literals, next_poll_delay,
-        parse_optional_arg, projected_select_list, qualified_table, result_output_location,
-        result_row_cell, validate_predicate, validate_predicate_columns, POLL_INITIAL, POLL_MAX,
+        build_athena_query, datum_row_to_result_row, describe_target, mask_string_literals,
+        next_poll_delay, parse_optional_arg, parse_reuse_minutes, parse_timeout_seconds,
+        projected_select_list, qualified_table, result_output_location, result_row_cell,
+        sleep_before_next_poll, validate_predicate, validate_predicate_columns, POLL_INITIAL,
+        POLL_MAX,
     };
     use crate::types::ColType;
     use aws_sdk_athena::operation::get_query_execution::GetQueryExecutionOutput;
@@ -1078,6 +1232,95 @@ mod tests {
             result_output_location(&GetQueryExecutionOutput::builder().build()),
             None
         );
+    }
+
+    /// An SdkConfig with, or without, a resolved region. Built offline: the
+    /// builder resolves nothing by itself.
+    fn config_with_region(region: Option<&str>) -> aws_config::SdkConfig {
+        let mut b = aws_config::SdkConfig::builder();
+        if let Some(r) = region {
+            b.set_region(Some(aws_config::Region::new(r.to_owned())));
+        }
+        b.build()
+    }
+
+    #[test]
+    fn describe_target_prefers_the_explicit_region() {
+        // The parameter beats the resolved config, because that is the region
+        // the lookup actually used.
+        assert_eq!(
+            describe_target(
+                "db",
+                "t",
+                Some("eu-west-1"),
+                &config_with_region(Some("us-east-1"))
+            ),
+            "table \"db\".\"t\" in region eu-west-1"
+        );
+    }
+
+    #[test]
+    fn describe_target_falls_back_to_the_resolved_region() {
+        assert_eq!(
+            describe_target("db", "t", None, &config_with_region(Some("us-east-1"))),
+            "table \"db\".\"t\" in region us-east-1"
+        );
+    }
+
+    #[test]
+    fn describe_target_says_so_when_no_region_resolved() {
+        // Athena and Glue both fail confusingly without a region, so the message
+        // has to distinguish "wrong region" from "no region at all".
+        assert_eq!(
+            describe_target("db", "t", None, &config_with_region(None)),
+            "table \"db\".\"t\" in region <no region configured>"
+        );
+    }
+
+    #[test]
+    fn polling_never_sleeps_past_the_deadline() {
+        // The backoff caps at 5s, so an unclamped sleep can overshoot a short
+        // timeout by nearly that much -- which would make timeout_seconds= fail
+        // to bound the wait it promises to bound.
+        let timeout = Duration::from_secs(1);
+        assert_eq!(
+            sleep_before_next_poll(Duration::from_secs(5), Duration::from_millis(750), timeout),
+            Duration::from_millis(250)
+        );
+        // Deadline already passed: do not sleep at all.
+        assert_eq!(
+            sleep_before_next_poll(Duration::from_secs(5), Duration::from_secs(2), timeout),
+            Duration::ZERO
+        );
+        // Far from the deadline the backoff is used unchanged.
+        assert_eq!(
+            sleep_before_next_poll(
+                Duration::from_millis(250),
+                Duration::ZERO,
+                Duration::from_secs(60)
+            ),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn timeout_seconds_must_be_positive() {
+        assert_eq!(parse_timeout_seconds(30).unwrap(), Duration::from_secs(30));
+        // 0 would abort instantly and a negative value cannot be a deadline;
+        // both are typos rather than intent.
+        assert!(parse_timeout_seconds(0).is_err());
+        assert!(parse_timeout_seconds(-1).is_err());
+    }
+
+    #[test]
+    fn reuse_minutes_bounded_by_athenas_seven_days() {
+        assert_eq!(parse_reuse_minutes(60).unwrap(), 60);
+        assert_eq!(parse_reuse_minutes(10080).unwrap(), 10080); // exactly 7 days
+                                                                // Past the limit Athena rejects the query; fail at bind with a message
+                                                                // that names the limit instead.
+        let err = parse_reuse_minutes(10081).unwrap_err();
+        assert!(err.contains("10080"), "{err}");
+        assert!(parse_reuse_minutes(0).is_err());
     }
 
     #[test]
