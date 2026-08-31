@@ -14,11 +14,11 @@ source](#build).
 ```bash
 # pick the asset matching your platform
 gh release download --repo ebunt/duckdb-athena \
-  --pattern 'duckdb_athena-osx_arm64.tar.gz'
-tar -xzf duckdb_athena-osx_arm64.tar.gz
+  --pattern 'athena-osx_arm64.tar.gz'
+tar -xzf athena-osx_arm64.tar.gz
 ```
 
-The archive contains a single file, `duckdb_athena.duckdb_extension`. **Do not
+The archive contains a single file, `athena.duckdb_extension`. **Do not
 rename it.** DuckDB derives the extension's init symbol from the file name, so a
 renamed file fails to load with:
 
@@ -31,11 +31,11 @@ it by name in later sessions:
 
 ```sql
 -- load from the path
-LOAD '/path/to/duckdb_athena.duckdb_extension';
+LOAD '/path/to/athena.duckdb_extension';
 
 -- or install once, then load by name in any later session
-INSTALL '/path/to/duckdb_athena.duckdb_extension';
-LOAD duckdb_athena;
+INSTALL '/path/to/athena.duckdb_extension';
+LOAD athena;
 ```
 
 Either way DuckDB must be started with the flags shown under [Load](#load).
@@ -50,18 +50,24 @@ Either way DuckDB must be started with the flags shown under [Load](#load).
 
 ## Build
 
+The build uses DuckDB's own C-API extension makefiles, vendored as a submodule,
+so a local build is byte-for-byte the process `duckdb/community-extensions`
+runs.
+
 ```bash
-make
+git submodule update --init   # once, if not cloned with --recurse-submodules
+make configure                # once: python venv, platform and version detection
+make release
 ```
 
-This compiles the extension and places it at `target/release/duckdb_athena.duckdb_extension`.
+This places the extension at `build/release/extension/athena/athena.duckdb_extension`.
 
 ## Releasing
 
 Pushing a `v*` tag triggers the release workflow (`.github/workflows/release.yml`):
 it runs `cargo fmt --check`, clippy and the tests, builds the extension for the
 two supported platforms (`linux_amd64`, `osx_arm64`), and publishes a GitHub
-Release with a `duckdb_athena-<platform>.tar.gz` asset for each.
+Release with a `athena-<platform>.tar.gz` asset for each.
 
 ```bash
 # land your changes on main first
@@ -104,7 +110,7 @@ duckdb -unsigned
 Then load the extension:
 
 ```sql
-LOAD 'target/release/duckdb_athena.duckdb_extension';
+LOAD 'build/release/extension/athena/athena.duckdb_extension';
 ```
 
 -OR-
@@ -112,7 +118,7 @@ LOAD 'target/release/duckdb_athena.duckdb_extension';
 In one statement:
 
 ```bash
-duckdb -unsigned -cmd "LOAD 'target/release/duckdb_athena.duckdb_extension';"
+duckdb -unsigned -cmd "LOAD 'build/release/extension/athena/athena.duckdb_extension';"
 ```
 
 > `SET allow_extensions_metadata_mismatch=true` is **not** required, on either a

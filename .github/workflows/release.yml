@@ -47,48 +47,44 @@ jobs:
                 include:
                     - platform: linux_amd64
                       runner: ubuntu-latest
-                      target: x86_64-unknown-linux-gnu
-                      library: libduckdb_athena.so
                     - platform: osx_arm64
                       runner: macos-14
-                      target: aarch64-apple-darwin
-                      library: libduckdb_athena.dylib
 
         steps:
             - uses: actions/checkout@v5
+              with:
+                  submodules: recursive
 
             - name: Install Rust toolchain
               uses: dtolnay/rust-toolchain@stable
-              with:
-                  targets: ${{ matrix.target }}
 
+            # The same targets duckdb/community-extensions runs, so this pipeline
+            # and that one build the extension identically.  also
+            # appends the metadata footer and leaves the packaged extension at
+            # build/release/extension/athena/.
             - name: Build release extension
-              run: cargo build --release --locked --target ${{ matrix.target }}
+              env:
+                  DUCKDB_PLATFORM: ${{ matrix.platform }}
+                  EXTENSION_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+              run: |
+                  export EXTENSION_VERSION="${EXTENSION_VERSION:0:31}"
+                  make configure
+                  make release
 
             - name: Package extension
-              env:
-                  DUCKDB_ABI_TYPE: C_STRUCT
-                  DUCKDB_CAPI_VERSION: v1.2.0
-                  DUCKDB_PLATFORM: ${{ matrix.platform }}
-                  DUCKDB_EXTENSION_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
               run: |
-                  mkdir -p dist/stage
-                  export DUCKDB_EXTENSION_VERSION="${DUCKDB_EXTENSION_VERSION:0:31}"
-                  # DuckDB derives the init symbol from the extension's file name,
-                  # so the file must be named duckdb_athena.duckdb_extension to match
-                  # the exported duckdb_athena_init_c_api. Ship it inside a
-                  # platform-named tarball rather than renaming the file itself.
-                  make package \
-                    BUILT_LIB="target/${{ matrix.target }}/release/${{ matrix.library }}" \
-                    EXTENSION="dist/stage/duckdb_athena.duckdb_extension"
-                  tar -czf "dist/duckdb_athena-${{ matrix.platform }}.tar.gz" \
-                    -C dist/stage duckdb_athena.duckdb_extension
+                  mkdir -p dist
+                  # DuckDB derives the init symbol from the file name, so the file
+                  # must stay athena.duckdb_extension to match athena_init_c_api.
+                  # Ship it inside a platform-named tarball instead of renaming it.
+                  tar -czf "dist/athena-${{ matrix.platform }}.tar.gz" \
+                    -C build/release/extension/athena athena.duckdb_extension
 
             - name: Upload build artifact
               uses: actions/upload-artifact@v7
               with:
-                  name: duckdb_athena-${{ matrix.platform }}
-                  path: dist/duckdb_athena-${{ matrix.platform }}.tar.gz
+                  name: athena-${{ matrix.platform }}
+                  path: dist/athena-${{ matrix.platform }}.tar.gz
                   if-no-files-found: error
 
     smoke:
@@ -108,7 +104,7 @@ jobs:
             - name: Download build artifact
               uses: actions/download-artifact@v8
               with:
-                  name: duckdb_athena-${{ matrix.platform }}
+                  name: athena-${{ matrix.platform }}
                   path: dist
 
             # The installer is a bash script: piping it to sh runs it under
@@ -123,11 +119,11 @@ jobs:
             # platform stamp and init symbol.
             - name: Load the packaged extension
               run: |
-                  tar -xzf "dist/duckdb_athena-${{ matrix.platform }}.tar.gz"
+                  tar -xzf "dist/athena-${{ matrix.platform }}.tar.gz"
                   version=$(~/.duckdb/cli/latest/duckdb -unsigned -noheader -list -c "
-                    LOAD '$PWD/duckdb_athena.duckdb_extension';
+                    LOAD '$PWD/athena.duckdb_extension';
                     SELECT extension_version FROM duckdb_extensions()
-                    WHERE extension_name = 'duckdb_athena';
+                    WHERE extension_name = 'athena';
                   ")
                   echo "loaded, extension_version=$version"
                   test -n "$version" || { echo "extension reported no version"; exit 1; }

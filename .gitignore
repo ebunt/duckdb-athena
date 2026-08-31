@@ -2,3 +2,7 @@
 /builderrors
 /.omc/
 AUDIT.md
+
+# extension-ci-tools build output
+build/
+configure/

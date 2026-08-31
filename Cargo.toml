@@ -14,7 +14,7 @@ time = { version = "0.3", features = ["macros", "parsing"] }
 aws-sdk-s3 = "1"
 
 [lib]
-name = "duckdb_athena"
+name = "athena"
 crate-type = ["cdylib"]
 
 [profile.release]
