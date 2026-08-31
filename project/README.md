@@ -1,11 +1,11 @@
 # Athena Extension — Python Examples
 
 Runs the [QUERIES.md](../QUERIES.md) examples against Athena through the
-`duckdb_athena` loadable extension, using the DuckDB Python library.
+`athena` loadable extension, using the DuckDB Python library.
 
 ## Prerequisites
 
-- The extension built at `../target/release/duckdb_athena.duckdb_extension`
+- The extension built at `../build/release/extension/athena/athena.duckdb_extension`
   (run `make` in the repo root).
 - AWS credentials with Athena, Glue, and S3 access, and a region set via
   `AWS_REGION` or an `~/.aws/config` profile.
@@ -44,5 +44,5 @@ cut the download short, but cannot shrink the query sent to Athena.
 | Env var | Default | Purpose |
 |---|---|---|
 | `ATHENA_OUTPUT_LOCATION` | (workgroup default) | Optional Athena results S3 path; when unset, derived from the workgroup default |
-| `ATHENA_EXTENSION_PATH` | `../target/release/duckdb_athena.duckdb_extension` | built extension to load |
+| `ATHENA_EXTENSION_PATH` | `../build/release/extension/athena/athena.duckdb_extension` | built extension to load |
 | `AWS_REGION` | (from `~/.aws/config`) | AWS region for Athena/Glue |

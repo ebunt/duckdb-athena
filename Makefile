@@ -11,7 +11,11 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 # Also the name of the cdylib and of the init symbol: DuckDB derives
 # athena_init_c_api from it, so src/lib.rs must match.
 EXTENSION_NAME=athena
-EXTENSION_VERSION=$(shell awk -F'"' '/^version = /{print "v"$$2; exit}' Cargo.toml)
+# ?= so the environment wins: a plain make stamps the crate version, while
+# release.yml passes the tag name (or the commit sha off a tag). A plain `=`
+# here would override the environment, which is the opposite of what Make
+# does for command-line variables and quietly loses build provenance.
+EXTENSION_VERSION ?= $(shell awk -F'"' '/^version = /{print "v"$$2; exit}' Cargo.toml)
 
 # The C API version this is built against, not the DuckDB version it runs on.
 # Deliberately no USE_UNSTABLE_C_API: quack-rs targets the stable C_STRUCT ABI,
