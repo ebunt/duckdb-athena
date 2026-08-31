@@ -168,6 +168,44 @@ SELECT * FROM athena_scan('my_table', workgroup='analytics');
 If no `output_location` is given and the workgroup has no result configuration,
 Athena rejects the query when it starts.
 
+### Region
+
+Defaults to whatever the AWS config chain resolves — `AWS_REGION`, or the active
+profile. Pass `region=` to read a table in another region without restarting
+DuckDB:
+
+```sql
+SELECT * FROM athena_scan('my_table', region='eu-west-1');
+```
+
+Region is worth setting explicitly when a lookup fails: a table that exists in
+another region reports the same "Entity Not Found" as one that does not exist,
+so the error message always names the region it searched.
+
+### Reuse a recent result
+
+Athena can return a previous identical query's result instead of re-running it,
+which scans no data and therefore costs nothing. Opt in per scan with a maximum
+age in minutes (Athena's own limit is 7 days):
+
+```sql
+SELECT COUNT(*) FROM athena_scan('my_table', result_reuse_minutes=60);
+```
+
+Measured on `sampledb.elb_logs`: the first run scanned 846 KB in 540 ms of
+engine time, the second scanned **0 bytes** in 154 ms and returned the same
+answer. Leave it off when the underlying data changes within the window.
+
+### Bound how long a query may run
+
+The scan waits up to an hour for Athena to finish, then stops the query rather
+than leaving it running. `timeout_seconds=` overrides that, to wait longer than
+a workgroup whose DML limit has been raised, or to fail fast:
+
+```sql
+SELECT * FROM athena_scan('my_table', timeout_seconds=120);
+```
+
 ### Specify a Glue database
 
 Defaults to the `default` database. Pass `database=` to override:
