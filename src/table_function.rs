@@ -1147,10 +1147,10 @@ pub fn build_table_function_def() -> TableFunctionBuilder {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_athena_query, datum_row_to_result_row, mask_string_literals, next_poll_delay,
-        parse_optional_arg, parse_reuse_minutes, parse_timeout_seconds, projected_select_list,
-        qualified_table, result_output_location, result_row_cell, validate_predicate,
-        validate_predicate_columns, POLL_INITIAL, POLL_MAX,
+        build_athena_query, datum_row_to_result_row, describe_target, mask_string_literals,
+        next_poll_delay, parse_optional_arg, parse_reuse_minutes, parse_timeout_seconds,
+        projected_select_list, qualified_table, result_output_location, result_row_cell,
+        validate_predicate, validate_predicate_columns, POLL_INITIAL, POLL_MAX,
     };
     use crate::types::ColType;
     use aws_sdk_athena::operation::get_query_execution::GetQueryExecutionOutput;
@@ -1228,6 +1228,49 @@ mod tests {
         assert_eq!(
             result_output_location(&GetQueryExecutionOutput::builder().build()),
             None
+        );
+    }
+
+    /// An SdkConfig with, or without, a resolved region. Built offline: the
+    /// builder resolves nothing by itself.
+    fn config_with_region(region: Option<&str>) -> aws_config::SdkConfig {
+        let mut b = aws_config::SdkConfig::builder();
+        if let Some(r) = region {
+            b.set_region(Some(aws_config::Region::new(r.to_owned())));
+        }
+        b.build()
+    }
+
+    #[test]
+    fn describe_target_prefers_the_explicit_region() {
+        // The parameter beats the resolved config, because that is the region
+        // the lookup actually used.
+        assert_eq!(
+            describe_target(
+                "db",
+                "t",
+                Some("eu-west-1"),
+                &config_with_region(Some("us-east-1"))
+            ),
+            "table \"db\".\"t\" in region eu-west-1"
+        );
+    }
+
+    #[test]
+    fn describe_target_falls_back_to_the_resolved_region() {
+        assert_eq!(
+            describe_target("db", "t", None, &config_with_region(Some("us-east-1"))),
+            "table \"db\".\"t\" in region us-east-1"
+        );
+    }
+
+    #[test]
+    fn describe_target_says_so_when_no_region_resolved() {
+        // Athena and Glue both fail confusingly without a region, so the message
+        // has to distinguish "wrong region" from "no region at all".
+        assert_eq!(
+            describe_target("db", "t", None, &config_with_region(None)),
+            "table \"db\".\"t\" in region <no region configured>"
         );
     }
 

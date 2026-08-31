@@ -61,7 +61,7 @@ LOAD 'build/release/extension/athena/athena.duckdb_extension';
 
 ## Live checks
 
-`scripts/live-check.sh [path/to/extension]` runs the extension against real Athena and compares each answer with Athena computing the same thing natively (14 checks; needs credentials, so CI cannot run it). Two of them need a partitioned fixture table and are skipped without one — set `ATHENA_TEST_PARTITIONED_TABLE` (default `default.claude_part_test`). Run it before cutting a release. It asserts on the SQL Athena received where the value alone would not prove anything — projection pushdown being the case in point.
+`scripts/live-check.sh [path/to/extension]` runs the extension against real Athena and compares each answer with Athena computing the same thing natively (17 checks; needs credentials, so CI cannot run it). Three of them need a partitioned fixture table and are skipped without one — set `ATHENA_TEST_PARTITIONED_TABLE` (default `default.claude_part_test`). Run it before cutting a release. It asserts on the SQL Athena received where the value alone would not prove anything — projection pushdown being the case in point.
 
 ## Testing
 
