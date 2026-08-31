@@ -61,5 +61,6 @@ docs:
     `output_location`.
 
     Required IAM: `athena:StartQueryExecution`, `athena:GetQueryExecution`,
-    `athena:GetQueryResults`, `glue:GetTable`, and `s3:GetObject`/`s3:PutObject`
+    `athena:GetQueryResults`, `athena:StopQueryExecution`, `glue:GetTable`, and
+    `s3:GetObject`/`s3:PutObject`
     on the workgroup's results bucket.
