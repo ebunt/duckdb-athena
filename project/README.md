@@ -13,14 +13,15 @@ Runs the [QUERIES.md](../QUERIES.md) examples against Athena through the
 ## Run
 
 ```bash
-# from the repo root
-uv run --project project python project/athena_examples.py --list      # list example names
-uv run --project project python project/athena_examples.py taxi_count  # run one example
-uv run --project project python project/athena_examples.py all         # run every example
+# from the repo root -- uv resolves the script against project/pyproject.toml,
+# so no --project or explicit python is needed
+uv run project/athena_examples.py --list      # list example names
+uv run project/athena_examples.py taxi_count  # run one example
+uv run project/athena_examples.py all         # run every example
 
 # or from inside project/
 cd project
-uv run python athena_examples.py taxi_projection
+uv run athena_examples.py taxi_projection
 ```
 
 The queries hit live Athena and scan real data (they cost money). `taxi_basic`
