@@ -1,9 +1,13 @@
-# Draft: upstream feature request for duckdb/duckdb
+# Upstream feature request for duckdb/duckdb
 
-Not filed yet. Post at https://github.com/duckdb/duckdb/issues/new (Feature
-request). Everything below was checked against the bindings for C API v1.2.0 as
-vendored by `libduckdb-sys` 1.10501.0 — worth re-checking against the newest
-release before filing, since the answer may have changed.
+**Filed as https://github.com/duckdb/duckdb/issues/25163** on 2026-08-30.
+
+Re-checked against DuckDB v1.5.5 before filing: `src/include/duckdb_extension.h`
+still contains no occurrence of `filter`, and the two in `src/include/duckdb.h`
+are prose about selection vectors. No existing issue or PR covered it.
+
+The text below is what was filed, kept here so the argument and the measurements
+survive if the issue is closed.
 
 ---
 
