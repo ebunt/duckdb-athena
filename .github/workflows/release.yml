@@ -47,8 +47,9 @@ jobs:
                 include:
                     - platform: linux_amd64
                       runner: ubuntu-latest
-                      # glibc 2.31: old enough to load on every current distro
-                      container: debian:11
+                      # The image duckdb/community-extensions builds linux_amd64
+                      # in (extension-ci-tools/docker/linux_amd64): glibc 2.28.
+                      container: quay.io/pypa/manylinux_2_28_x86_64
                     - platform: osx_arm64
                       runner: macos-14
                       container: ''
@@ -64,17 +65,18 @@ jobs:
               if: matrix.container == ''
               uses: dtolnay/rust-toolchain@stable
 
-            # Linux builds run in Debian 11 (glibc 2.31). Building on the runner
-            # links against whatever glibc ubuntu-latest ships -- 2.39 today --
-            # and the result then fails to load on Amazon Linux 2023 (2.34),
-            # RHEL 9 (2.34), Debian 12 (2.36) or Ubuntu 22.04 (2.35). glibc is
-            # backward compatible, so an older baseline runs everywhere newer.
-            # macOS has no equivalent problem and builds on the runner.
+            # Building on the runner links against whatever glibc
+            # ubuntu-latest ships -- 2.39 today -- and the result then fails to
+            # load on Amazon Linux 2023 (2.34), RHEL 9 (2.34), Debian 12 (2.36)
+            # or Ubuntu 22.04 (2.35). glibc is backward compatible, so an older
+            # baseline runs everywhere newer. The manylinux image already
+            # carries git (checkout needs it before this step runs), make, gcc
+            # and python3, so only Rust has to be added -- the same toolchain
+            # community-extensions installs. macOS has no equivalent problem and
+            # builds on the runner.
             - name: Prepare container toolchain
               if: matrix.container != ''
               run: |
-                  apt-get update -qq
-                  apt-get install -y -qq curl python3 python3-venv git make >/dev/null
                   curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
                   echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
                   git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -102,8 +104,8 @@ jobs:
                   max=$(strings build/release/extension/athena/athena.duckdb_extension \
                         | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
                   echo "highest glibc symbol required: $max"
-                  if [ "$(printf '%s\n' "$max" "GLIBC_2.31" | sort -V | tail -1)" != "GLIBC_2.31" ]; then
-                    echo "$max exceeds the 2.31 baseline: will not load on Amazon Linux 2023, RHEL 9 or Debian 12"
+                  if [ "$(printf '%s\n' "$max" "GLIBC_2.28" | sort -V | tail -1)" != "GLIBC_2.28" ]; then
+                    echo "$max exceeds the 2.28 baseline: will not load on Amazon Linux 2023, RHEL 9 or Debian 12"
                     exit 1
                   fi
 
