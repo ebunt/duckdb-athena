@@ -206,6 +206,21 @@ a workgroup whose DML limit has been raised, or to fail fast:
 SELECT * FROM athena_scan('my_table', timeout_seconds=120);
 ```
 
+> **Ctrl-C does not stop the Athena query.** The scan spends its time blocked in
+> the poll loop, which does not check DuckDB's interrupt flag, so an interrupted
+> query keeps running to completion and you are billed for every byte it scans —
+> DuckDB only reports the cancellation once the poll returns. Measured: a 91 MB
+> `COUNT(*)` interrupted 1.2 s in still reached `SUCCEEDED`, scanning 95,774,673
+> bytes. To cancel for real, stop it in Athena using the execution id the scan
+> printed when it started:
+>
+> ```bash
+> aws athena stop-query-execution --query-execution-id <execution id>
+> ```
+>
+> `timeout_seconds=` is the exception: on expiry the extension stops the query
+> itself rather than leaving it running.
+
 ### Specify a Glue database
 
 Defaults to the `default` database. Pass `database=` to override:
@@ -314,3 +329,9 @@ SELECT COUNT(*) FROM athena_scan('my_table');
 - Returns all rows by default; pass `maxrows=N` to cap (an outer DuckDB `LIMIT` is not pushed to Athena)
 - Results are streamed from the query's result CSV on S3 (one `GetObject`), which needs `s3:GetObject` on the results bucket. Workgroups using Athena-managed query results expose no S3 location, so those fall back to `GetQueryResults` paging at 1000 rows per call (~8 rows/ms)
 - Workgroup defaults to `primary`; override with `workgroup=`
+
+## License
+
+MIT — see [LICENSE](LICENSE). This extension began as a fork of
+[dacort/duckdb-athena-extension](https://github.com/dacort/duckdb-athena-extension)
+by Damon P. Cortesi, whose copyright is retained alongside later work.
