@@ -19,9 +19,7 @@ use quack_rs::{
     types::{LogicalType, TypeId},
 };
 use std::{
-    collections::HashMap,
     ffi::CString,
-    sync::{LazyLock, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -36,9 +34,10 @@ struct ScanBindData {
     /// workgroup's own result configuration.
     output_location: Option<String>,
     workgroup: String,
-    /// Overrides the region the AWS config would otherwise resolve, so one
-    /// DuckDB session can query more than one region.
-    region: Option<String>,
+    /// AWS config for this scan, resolved once at bind (honouring `region=`)
+    /// and reused by init. Scoped to the scan: a long-lived process that
+    /// changes `AWS_PROFILE` between queries must see the new profile.
+    config: aws_config::SdkConfig,
     /// How long to wait for the Athena query to reach a terminal state.
     timeout: Duration,
     /// Minutes Athena may reuse a previous identical query's result for, or
@@ -243,6 +242,13 @@ const DEFAULT_POLL_WAIT: Duration = Duration::from_secs(60 * 60);
 
 /// Athena will not reuse a result older than 7 days.
 const MAX_RESULT_REUSE_MINUTES: i32 = 7 * 24 * 60;
+
+/// How long to sleep before the next state check: the backoff, but never past
+/// the deadline. Without the clamp a 5s backoff can overshoot a short timeout by
+/// almost 5s, so `timeout_seconds` would not bound the wait it promises to.
+fn sleep_before_next_poll(poll_delay: Duration, elapsed: Duration, timeout: Duration) -> Duration {
+    poll_delay.min(timeout.saturating_sub(elapsed))
+}
 
 /// Next poll delay: exponential backoff doubling up to `cap`.
 fn next_poll_delay(current: Duration, cap: Duration) -> Duration {
@@ -764,7 +770,7 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
             }
         };
 
-        let config = aws_config_for(region.as_deref());
+        let config = load_aws_config(region.as_deref());
         let client = GlueClient::new(&config);
 
         let table_result = crate::RUNTIME.block_on(
@@ -851,7 +857,7 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
                 workgroup,
                 limit: maxrows,
                 predicate,
-                region,
+                config: config.clone(),
                 timeout,
                 result_reuse_minutes,
                 columns,
@@ -876,26 +882,16 @@ fn describe_target(
     format!("table \"{database}\".\"{tablename}\" in region {region}")
 }
 
-/// Loads AWS config once per (optional) region and caches it. Bind and init each
-/// need a client, and resolving credentials twice per scan costs a round trip
-/// against IMDS or SSO for nothing.
-fn aws_config_for(region: Option<&str>) -> aws_config::SdkConfig {
-    static CACHE: LazyLock<Mutex<HashMap<Option<String>, aws_config::SdkConfig>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
-
-    let key = region.map(str::to_owned);
-    if let Some(cached) = CACHE.lock().ok().and_then(|c| c.get(&key).cloned()) {
-        return cached;
-    }
+/// Resolves AWS config for one scan. Bind loads it and init reuses it through
+/// the bind data, so credentials and region resolve once per scan rather than
+/// twice — but never across scans: a long-lived process that changes
+/// `AWS_PROFILE` between queries must see the new profile, not a cached one.
+fn load_aws_config(region: Option<&str>) -> aws_config::SdkConfig {
     let mut loader = aws_config::defaults(BehaviorVersion::latest());
     if let Some(region) = region {
         loader = loader.region(Region::new(region.to_owned()));
     }
-    let config = crate::RUNTIME.block_on(loader.load());
-    if let Ok(mut cache) = CACHE.lock() {
-        cache.insert(key, config.clone());
-    }
-    config
+    crate::RUNTIME.block_on(loader.load())
 }
 
 /// S3 location of a finished query's result file, or `None` when the execution
@@ -979,7 +975,9 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
             .filter_map(|&i| bind_data.col_types.get(i).copied())
             .collect();
 
-        let config = aws_config_for(bind_data.region.as_deref());
+        // Loaded at bind for this scan; reusing it here avoids resolving
+        // credentials a second time without outliving the scan.
+        let config = bind_data.config.clone();
         let client = AthenaClient::new(&config);
 
         let query = build_athena_query(&select_list, &database, &tablename, predicate, maxrows);
@@ -1084,7 +1082,11 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
                     }
                     // Deliberately quiet: DuckDB renders its own progress bar
                     // while the scan runs, and a line per poll scrolls it away.
-                    thread::sleep(poll_delay);
+                    thread::sleep(sleep_before_next_poll(
+                        poll_delay,
+                        poll_start.elapsed(),
+                        timeout,
+                    ));
                     poll_delay = next_poll_delay(poll_delay, POLL_MAX);
                 }
                 Cancelled | Failed => {
@@ -1150,7 +1152,8 @@ mod tests {
         build_athena_query, datum_row_to_result_row, describe_target, mask_string_literals,
         next_poll_delay, parse_optional_arg, parse_reuse_minutes, parse_timeout_seconds,
         projected_select_list, qualified_table, result_output_location, result_row_cell,
-        validate_predicate, validate_predicate_columns, POLL_INITIAL, POLL_MAX,
+        sleep_before_next_poll, validate_predicate, validate_predicate_columns, POLL_INITIAL,
+        POLL_MAX,
     };
     use crate::types::ColType;
     use aws_sdk_athena::operation::get_query_execution::GetQueryExecutionOutput;
@@ -1271,6 +1274,32 @@ mod tests {
         assert_eq!(
             describe_target("db", "t", None, &config_with_region(None)),
             "table \"db\".\"t\" in region <no region configured>"
+        );
+    }
+
+    #[test]
+    fn polling_never_sleeps_past_the_deadline() {
+        // The backoff caps at 5s, so an unclamped sleep can overshoot a short
+        // timeout by nearly that much -- which would make timeout_seconds= fail
+        // to bound the wait it promises to bound.
+        let timeout = Duration::from_secs(1);
+        assert_eq!(
+            sleep_before_next_poll(Duration::from_secs(5), Duration::from_millis(750), timeout),
+            Duration::from_millis(250)
+        );
+        // Deadline already passed: do not sleep at all.
+        assert_eq!(
+            sleep_before_next_poll(Duration::from_secs(5), Duration::from_secs(2), timeout),
+            Duration::ZERO
+        );
+        // Far from the deadline the backoff is used unchanged.
+        assert_eq!(
+            sleep_before_next_poll(
+                Duration::from_millis(250),
+                Duration::ZERO,
+                Duration::from_secs(60)
+            ),
+            Duration::from_millis(250)
         );
     }
 
