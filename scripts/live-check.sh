@@ -136,26 +136,61 @@ PART_TABLE="${ATHENA_TEST_PARTITIONED_TABLE:-default.claude_part_test}"
 part_db="${PART_TABLE%%.*}"
 part_tbl="${PART_TABLE##*.}"
 if aws glue get-table --database-name "$part_db" --name "$part_tbl" > /dev/null 2>&1; then
-    expected=$(aws glue get-table --database-name "$part_db" --name "$part_tbl" \
-        --query 'join(`,`, Table.StorageDescriptor.Columns[].Name)' --output text)
-    expected="$expected,$(aws glue get-table --database-name "$part_db" --name "$part_tbl" \
-        --query 'join(`,`, Table.PartitionKeys[].Name)' --output text)"
-    actual=$(duckdb -unsigned -noheader -list -c "LOAD '$EXTENSION';
-        SELECT string_agg(column_name, ',') FROM (
+    glue_names() {
+        aws glue get-table --database-name "$part_db" --name "$part_tbl" \
+            --query "join(\`,\`, $1[].Name)" --output text
+    }
+    data_cols=$(glue_names 'Table.StorageDescriptor.Columns')
+    part_cols=$(glue_names 'Table.PartitionKeys')
+    expected="$data_cols,$part_cols"
+
+    # DESCRIBE only binds the table function, so on its own it proves the
+    # declared schema and nothing about the rows. Check it, then check the rows.
+    actual=$(duck "SELECT string_agg(column_name, ',') FROM (
             DESCRIBE SELECT * FROM athena_scan('$part_tbl', database='$part_db')
-        );" 2>/dev/null)
+        );")
     check "partition columns come last" "$expected" "$actual"
 
-    parts=$(aws glue get-table --database-name "$part_db" --name "$part_tbl" \
-        --query 'Table.PartitionKeys[0].Name' --output text)
-    # Selecting only a partition column reads no data at all: the values live in
-    # the catalog, so Athena reports 0 bytes scanned.
-    duck "SELECT COUNT(DISTINCT $parts) FROM athena_scan('$part_tbl', database='$part_db');" > /dev/null
-    last=$(aws athena list-query-executions --work-group "$WORKGROUP" --max-items 1 \
-        --query 'QueryExecutionIds[0]' --output text | head -1)
-    scanned=$(aws athena get-query-execution --query-execution-id "$last" \
-        --query 'QueryExecution.Statistics.DataScannedInBytes' --output text)
-    check "partition-only scan reads 0 bytes" "0" "$scanned"
+    # Every column of every row, concatenated in schema order and compared with
+    # Athena's own answer: this is what catches values landing in the wrong
+    # column, which is the failure a schema-only check sails past.
+    row_expr=""
+    for c in $(echo "$expected" | tr ',' ' '); do
+        [ -n "$row_expr" ] && row_expr="$row_expr || '|' || "
+        row_expr="${row_expr}COALESCE(CAST(\"$c\" AS VARCHAR), '')"
+    done
+    check "partition table rows match Athena" \
+        "$(athena "SELECT array_join(array_agg($row_expr ORDER BY $row_expr), ';') FROM $part_db.$part_tbl")" \
+        "$(duck "SELECT string_agg($row_expr, ';' ORDER BY $row_expr) FROM athena_scan('$part_tbl', database='$part_db');")"
+
+    # Selecting only a partition column should not read the data files: the
+    # values live in the catalog. Compared against a full scan rather than
+    # asserted as zero, since a non-columnar fixture may still read something.
+    part_one=$(echo "$part_cols" | cut -d, -f1)
+    if ! duck "SELECT COUNT(DISTINCT \"$part_one\") FROM athena_scan('$part_tbl', database='$part_db');" > /dev/null; then
+        printf 'FAIL %-42s scan of the partition column failed\n' "partition-only scan reads less"
+        fail=$((fail + 1))
+    else
+        last_bytes() {
+            local id
+            id=$(aws athena list-query-executions --work-group "$WORKGROUP" --max-items 1 \
+                --query 'QueryExecutionIds[0]' --output text | head -1)
+            aws athena get-query-execution --query-execution-id "$id" \
+                --query 'QueryExecution.Statistics.DataScannedInBytes' --output text
+        }
+        part_bytes=$(last_bytes)
+        duck "SELECT COUNT(*) FROM athena_scan('$part_tbl', database='$part_db');" > /dev/null
+        full_bytes=$(last_bytes)
+        if [ "$part_bytes" -lt "$full_bytes" ] || [ "$part_bytes" -eq 0 ]; then
+            printf 'ok   %-42s %s vs %s bytes for a full scan\n' \
+                "partition-only scan reads less" "$part_bytes" "$full_bytes"
+            pass=$((pass + 1))
+        else
+            printf 'FAIL %-42s %s bytes, full scan %s\n' \
+                "partition-only scan reads less" "$part_bytes" "$full_bytes"
+            fail=$((fail + 1))
+        fi
+    fi
 else
     printf 'skip %-42s no partitioned fixture (%s)\n' "partitioned table checks" "$PART_TABLE"
 fi
