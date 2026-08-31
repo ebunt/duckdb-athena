@@ -6,7 +6,7 @@ Runs the [QUERIES.md](../QUERIES.md) examples against Athena through the
 ## Prerequisites
 
 - The extension built at `../build/release/extension/athena/athena.duckdb_extension`
-  (run `make` in the repo root).
+  (run `make configure && make release` in the repo root).
 - AWS credentials with Athena, Glue, and S3 access, and a region set via
   `AWS_REGION` or an `~/.aws/config` profile.
 
@@ -28,17 +28,22 @@ The queries hit live Athena and scan real data (they cost money). `taxi_basic`
 is the cheapest smoke test: `maxrows=10` becomes `LIMIT 10` in the Athena query,
 so it returns immediately.
 
-Examples without `maxrows` (`taxi_projection`, `taxi_avg_tip`) make Athena
-execute over the whole table and write the full result set to S3 before the
-first row is available. That is the slow part, and only `maxrows` reduces it —
-it is the one knob that changes the query Athena actually runs.
+Examples without `maxrows` make Athena execute over the whole table and write
+the full result to S3 before the first row is available. Only `maxrows` and
+`predicate=` change the query Athena actually runs, and so only they reduce
+what is scanned and billed; a DuckDB `WHERE` or `LIMIT` filters after the rows
+arrive.
 
-How much then crosses the network depends on the query. Result pages are
-fetched lazily, so a consumer that stops early stops the download: `.show()`
-previews a few thousand rows, so `taxi_projection` only pulls the first few
-pages. An aggregate has no such shortcut — `taxi_avg_tip` must pull every row
-to group it, as would an unbounded `COUNT(*)`. A DuckDB `LIMIT` can likewise
-cut the download short, but cannot shrink the query sent to Athena.
+Fetching that result is no longer the bottleneck it once was: it is streamed
+from the single CSV Athena writes, in one request, so `taxi_count` returns the
+true 1,070,262 in about 3 seconds. It used to be paged back 1000 rows at a
+time, which took roughly 135 seconds. Consumers that stop early still stop the
+download; aggregates like `taxi_avg_tip` have no such shortcut and read every
+row.
+
+`elb_reuse` is worth running twice. The second run is served from Athena's
+result cache — 0 bytes scanned, nothing billed — which `result_reuse_minutes=`
+opts into.
 
 ## Configuration
 
@@ -46,4 +51,5 @@ cut the download short, but cannot shrink the query sent to Athena.
 |---|---|---|
 | `ATHENA_OUTPUT_LOCATION` | (workgroup default) | Optional Athena results S3 path; when unset, derived from the workgroup default |
 | `ATHENA_EXTENSION_PATH` | `../build/release/extension/athena/athena.duckdb_extension` | built extension to load |
-| `AWS_REGION` | (from `~/.aws/config`) | AWS region for Athena/Glue |
+| `AWS_REGION` | (from `~/.aws/config`) | AWS region for Athena/Glue; `region=` on a scan overrides it, as `elb_region` shows |
+| `ATHENA_PARTITIONED_TABLE` | `default.claude_part_test` | `db.table` fixture for the `partitioned` example |
