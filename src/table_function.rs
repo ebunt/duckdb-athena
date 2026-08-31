@@ -254,16 +254,32 @@ const MAX_RESULT_REUSE_MINUTES: i32 = 7 * 24 * 60;
 /// documented permissions before `athena:StopQueryExecution` was among them, so
 /// the message names it rather than leaving a silent charge to be discovered on
 /// the bill.
-fn timeout_message(id: &str, state: &str, secs: u64, stop_err: Option<&str>) -> String {
+///
+/// The recovery command carries `--region` for the same reason `describe_target`
+/// always names the region: with `region=` the query runs where the scan pointed
+/// it, not where the CLI defaults, and a stop sent elsewhere cancels nothing.
+fn timeout_message(
+    id: &str,
+    state: &str,
+    secs: u64,
+    region: Option<&str>,
+    stop_err: Option<&str>,
+) -> String {
     let base = format!("Athena query {id} still {state} after {secs}s; aborting");
-    match stop_err {
-        None => base,
-        Some(e) => format!(
-            "{base}. Stopping it failed, so it may still be running and billing \
-             -- stop it with `aws athena stop-query-execution --query-execution-id {id}` \
-             (needs athena:StopQueryExecution): {e}"
-        ),
-    }
+    let Some(e) = stop_err else {
+        return base;
+    };
+    // No region resolved means no correct command to print: naming a region the
+    // scan did not use would be worse than telling the reader to supply one.
+    let region_flag = match region {
+        Some(r) => format!(" --region {r}"),
+        None => " --region <the region the scan used>".to_string(),
+    };
+    format!(
+        "{base}. Stopping it failed, so it may still be running and billing \
+         -- stop it with `aws athena stop-query-execution --query-execution-id {id}{region_flag}` \
+         (needs athena:StopQueryExecution): {e}"
+    )
 }
 
 fn sleep_before_next_poll(poll_delay: Duration, elapsed: Duration, timeout: Duration) -> Duration {
@@ -1089,10 +1105,12 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
                                 .query_execution_id(query_execution_id.clone())
                                 .send(),
                         );
+                        let region = config.region().map(|r| r.to_string());
                         let msg = timeout_message(
                             &query_execution_id,
                             &format!("{state:?}"),
                             timeout.as_secs(),
+                            region.as_deref(),
                             stop.err().map(|e| e.to_string()).as_deref(),
                         );
                         let c_msg = CString::new(msg).unwrap_or_default();
@@ -1303,11 +1321,17 @@ mod tests {
         // athena:StopQueryExecution is the usual reason -- the query keeps
         // scanning and billing after DuckDB has given up, so the error has to
         // say so and name the missing permission.
-        let quiet = timeout_message("abc", "Running", 60, None);
+        let quiet = timeout_message("abc", "Running", 60, Some("eu-west-1"), None);
         assert_eq!(quiet, "Athena query abc still Running after 60s; aborting");
         assert!(!quiet.contains("billing"));
 
-        let noisy = timeout_message("abc", "Running", 60, Some("AccessDeniedException"));
+        let noisy = timeout_message(
+            "abc",
+            "Running",
+            60,
+            Some("eu-west-1"),
+            Some("AccessDeniedException"),
+        );
         assert!(
             noisy.contains("may still be running and billing"),
             "{noisy}"
@@ -1315,6 +1339,17 @@ mod tests {
         assert!(noisy.contains("athena:StopQueryExecution"), "{noisy}");
         assert!(noisy.contains("AccessDeniedException"), "{noisy}");
         assert!(noisy.contains("abc"), "{noisy}");
+        // The command has to target the region the scan used, not whatever the
+        // CLI defaults to -- a stop sent to the wrong region cancels nothing.
+        assert!(noisy.contains("--region eu-west-1"), "{noisy}");
+
+        // With no region resolved, ask for one rather than printing a command
+        // that would silently target the wrong place.
+        let vague = timeout_message("abc", "Running", 60, None, Some("boom"));
+        assert!(
+            vague.contains("--region <the region the scan used>"),
+            "{vague}"
+        );
     }
 
     #[test]
