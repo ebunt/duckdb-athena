@@ -32,9 +32,21 @@ DEFAULT_EXT = (
 # `output_location=` when ATHENA_OUTPUT_LOCATION is provided. Single quotes are
 # doubled to keep the embedded SQL string literal valid.
 # Partitioned fixture for the `partitioned` example; override if yours differs.
-PART_DB, _, PART_TABLE = os.environ.get(
-    "ATHENA_PARTITIONED_TABLE", "default.claude_part_test"
-).partition(".")
+# The pruning predicate is only known for the default fixture -- someone else's
+# partitioned table has different key names, and a wrong one now fails at bind
+# with an unknown-column error. So: ask for it, and omit it when not given.
+DEFAULT_PART_TABLE = "default.claude_part_test"
+PART_SPEC = os.environ.get("ATHENA_PARTITIONED_TABLE", DEFAULT_PART_TABLE)
+PART_DB, _, PART_TABLE = PART_SPEC.partition(".")
+PART_PREDICATE = os.environ.get(
+    "ATHENA_PARTITIONED_PREDICATE",
+    "yr = 2024" if PART_SPEC == DEFAULT_PART_TABLE else "",
+)
+_PART_PRED = (
+    f", predicate='{PART_PREDICATE.replace(chr(39), chr(39) * 2)}'"
+    if PART_PREDICATE
+    else ""
+)
 
 OUTPUT = os.environ.get("ATHENA_OUTPUT_LOCATION")
 _OUT = f", output_location='{OUTPUT.replace(chr(39), chr(39) * 2)}'" if OUTPUT else ""
@@ -134,8 +146,7 @@ QUERIES: dict[str, str] = {
     # last; a predicate on one prunes instead of scanning. Needs the fixture
     # named by ATHENA_PARTITIONED_TABLE.
     "partitioned": f"""
-        SELECT * FROM athena_scan('{PART_TABLE}'{_OUT}, database='{PART_DB}',
-                                  predicate='yr = 2024')
+        SELECT * FROM athena_scan('{PART_TABLE}'{_OUT}, database='{PART_DB}'{_PART_PRED})
     """,
 }
 

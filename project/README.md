@@ -29,10 +29,13 @@ is the cheapest smoke test: `maxrows=10` becomes `LIMIT 10` in the Athena query,
 so it returns immediately.
 
 Examples without `maxrows` make Athena execute over the whole table and write
-the full result to S3 before the first row is available. Only `maxrows` and
-`predicate=` change the query Athena actually runs, and so only they reduce
-what is scanned and billed; a DuckDB `WHERE` or `LIMIT` filters after the rows
-arrive.
+the full result to S3 before the first row is available.
+
+Three things change the query Athena actually runs, and so reduce what is
+scanned and billed: the columns you select (pushed into the `SELECT` list
+automatically — `taxi_projection` sends two columns, not eighteen, which on
+Parquet and ORC means fewer bytes read), `predicate=`, and `maxrows`. A DuckDB
+`WHERE` or `LIMIT` does not: those filter after the rows arrive.
 
 Fetching that result is no longer the bottleneck it once was: it is streamed
 from the single CSV Athena writes, in one request, so `taxi_count` returns the
@@ -53,3 +56,4 @@ opts into.
 | `ATHENA_EXTENSION_PATH` | `../build/release/extension/athena/athena.duckdb_extension` | built extension to load |
 | `AWS_REGION` | (from `~/.aws/config`) | AWS region for Athena/Glue; `region=` on a scan overrides it, as `elb_region` shows |
 | `ATHENA_PARTITIONED_TABLE` | `default.claude_part_test` | `db.table` fixture for the `partitioned` example |
+| `ATHENA_PARTITIONED_PREDICATE` | `yr = 2024` for the default fixture, otherwise none | pruning predicate for that example; pointing at your own table without setting this just omits it, since partition keys differ |
