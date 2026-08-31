@@ -1,9 +1,9 @@
 """Run the QUERIES.md examples against Athena via the athena extension.
 
 Usage (from repo root):
-    uv run --project project python project/athena_examples.py --list
-    uv run --project project python project/athena_examples.py taxi_count
-    uv run --project project python project/athena_examples.py all
+    uv run project/athena_examples.py --list
+    uv run project/athena_examples.py taxi_count
+    uv run project/athena_examples.py all
 
 Requires:
     - The extension built at ../build/release/extension/athena/athena.duckdb_extension
@@ -23,12 +23,31 @@ from pathlib import Path
 import duckdb
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_EXT = REPO_ROOT / "build" / "release" / "extension" / "athena" / "athena.duckdb_extension"
+DEFAULT_EXT = (
+    REPO_ROOT / "build" / "release" / "extension" / "athena" / "athena.duckdb_extension"
+)
 
 # Optional explicit Athena results location. When unset, athena_scan uses the
 # workgroup's default result configuration, so the queries below only add
 # `output_location=` when ATHENA_OUTPUT_LOCATION is provided. Single quotes are
 # doubled to keep the embedded SQL string literal valid.
+# Partitioned fixture for the `partitioned` example; override if yours differs.
+# The pruning predicate is only known for the default fixture -- someone else's
+# partitioned table has different key names, and a wrong one now fails at bind
+# with an unknown-column error. So: ask for it, and omit it when not given.
+DEFAULT_PART_TABLE = "default.claude_part_test"
+PART_SPEC = os.environ.get("ATHENA_PARTITIONED_TABLE", DEFAULT_PART_TABLE)
+PART_DB, _, PART_TABLE = PART_SPEC.partition(".")
+PART_PREDICATE = os.environ.get(
+    "ATHENA_PARTITIONED_PREDICATE",
+    "yr = 2024" if PART_SPEC == DEFAULT_PART_TABLE else "",
+)
+_PART_PRED = (
+    f", predicate='{PART_PREDICATE.replace(chr(39), chr(39) * 2)}'"
+    if PART_PREDICATE
+    else ""
+)
+
 OUTPUT = os.environ.get("ATHENA_OUTPUT_LOCATION")
 _OUT = f", output_location='{OUTPUT.replace(chr(39), chr(39) * 2)}'" if OUTPUT else ""
 
@@ -44,13 +63,13 @@ QUERIES: dict[str, str] = {
         SELECT trip_distance, total_amount
         FROM athena_scan('data'{_OUT}, database='nyctaxi')
     """,
-    # COUNT(*) projects no columns, so Athena scans no column data — but it
-    # still returns one row per table row, paged back 1000 at a time. Unbounded
-    # on nyctaxi that never finishes, so cap it: this counts the capped rows,
-    # not the table. For a true count, run COUNT(*) in Athena directly.
+    # An unbounded count over 1.07M rows, back in seconds: the result is
+    # streamed from the single CSV Athena writes to S3 rather than paged 1000
+    # rows at a time. DuckDB keeps one placeholder column for COUNT(*), so this
+    # reads one column of every row.
     "taxi_count": f"""
         SELECT COUNT(*) AS trips
-        FROM athena_scan('data'{_OUT}, database='nyctaxi', maxrows=1000)
+        FROM athena_scan('data'{_OUT}, database='nyctaxi')
     """,
     "taxi_avg_tip": f"""
         SELECT payment_type,
@@ -60,34 +79,42 @@ QUERIES: dict[str, str] = {
         GROUP BY payment_type
         ORDER BY trips DESC
     """,
-    "flights_predicate": f"""
-        SELECT carrier, origin, dest, dep_delay
-        FROM athena_scan('flights'{_OUT}, database='flights',
-                         predicate='dep_delay > 120')
+    # predicate= is evaluated by Athena, so it cuts what is scanned and
+    # returned. A plain DuckDB WHERE cannot: the C extension API exposes no
+    # filter pushdown (duckdb/duckdb#25163).
+    "taxi_predicate": f"""
+        SELECT vendorid, passenger_count, total_amount
+        FROM athena_scan('data'{_OUT}, database='nyctaxi',
+                         predicate='passenger_count = 9')
     """,
-    "flights_combined": f"""
-        SELECT carrier, COUNT(*) AS long_delays
-        FROM athena_scan('flights'{_OUT}, database='flights',
-                         predicate='year = 2016')
-        WHERE dep_delay > 60
-        GROUP BY carrier
-        ORDER BY long_delays DESC
+    # Both filters at once: Athena narrows to one payment type, DuckDB applies
+    # the rest locally once the rows arrive.
+    "taxi_combined": f"""
+        SELECT payment_type, COUNT(*) AS trips, ROUND(AVG(tip_amount), 2) AS avg_tip
+        FROM athena_scan('data'{_OUT}, database='nyctaxi',
+                         predicate='payment_type = 1')
+        WHERE tip_amount > 5
+        GROUP BY payment_type
+    """,
+    # A hyphenated Glue database name has to survive quoting on the way to
+    # Athena.
+    "covid_population": f"""
+        SELECT county, state, "population estimate 2018" AS pop_2018
+        FROM athena_scan('county_populations'{_OUT}, database='covid-19')
+        WHERE state = 'New York'
+        ORDER BY TRY_CAST("population estimate 2018" AS BIGINT) DESC
         LIMIT 10
     """,
-    "covid_state": f"""
-        SELECT date, county, state, cases, deaths
-        FROM athena_scan('nytimes_counties'{_OUT}, database='covid-19',
-                         predicate='state = ''New York''')
-    """,
-    "covid_join": f"""
-        SELECT c.state,
-               SUM(c.cases)                                         AS total_cases,
-               MAX(TRY_CAST(p."population estimate 2018" AS BIGINT)) AS pop_2018
-        FROM athena_scan('nytimes_counties'{_OUT}, database='covid-19') c
-        JOIN athena_scan('county_populations'{_OUT}, database='covid-19') p
-          ON c.county = p.county AND c.state = p.state
-        GROUP BY c.state
-        ORDER BY total_cases DESC
+    # Two scans joined inside DuckDB: each runs its own Athena query, and the
+    # join happens locally.
+    "tpcds_join": f"""
+        SELECT a.ca_state, COUNT(*) AS customers
+        FROM athena_scan('customer'{_OUT}, database='tpcds',
+                         predicate='c_birth_year >= 1980') c
+        JOIN athena_scan('customer_address'{_OUT}, database='tpcds') a
+          ON c.c_current_addr_sk = a.ca_address_sk
+        GROUP BY a.ca_state
+        ORDER BY customers DESC
         LIMIT 10
     """,
     "tpcds_customer": f"""
@@ -101,6 +128,26 @@ QUERIES: dict[str, str] = {
         GROUP BY elbresponsecode
         ORDER BY n DESC
     """,
+    # Run this twice: the second run is served from Athena's result cache,
+    # scanning 0 bytes and costing nothing. Only safe while the data underneath
+    # is not changing.
+    "elb_reuse": f"""
+        SELECT COUNT(url) AS urls
+        FROM athena_scan('elb_logs'{_OUT}, database='sampledb',
+                         result_reuse_minutes=60)
+    """,
+    # region= overrides whatever the AWS config chain resolved, so one session
+    # can read tables in more than one region.
+    "elb_region": f"""
+        SELECT COUNT(*) AS n
+        FROM athena_scan('elb_logs'{_OUT}, database='sampledb', region='us-east-1')
+    """,
+    # Glue keeps partition keys out of the column list and Athena returns them
+    # last; a predicate on one prunes instead of scanning. Needs the fixture
+    # named by ATHENA_PARTITIONED_TABLE.
+    "partitioned": f"""
+        SELECT * FROM athena_scan('{PART_TABLE}'{_OUT}, database='{PART_DB}'{_PART_PRED})
+    """,
 }
 
 
@@ -111,10 +158,12 @@ def connect(ext_path: Path) -> duckdb.DuckDBPyConnection:
             f"Extension not found at {ext_path}\n"
             "Build it with `make release` in the repo root, or set ATHENA_EXTENSION_PATH."
         )
-    # allow_unsigned_extensions + metadata mismatch: locally compiled extensions
-    # lack the signature/metadata DuckDB expects from official releases.
+    # Locally compiled extensions carry no release signature, hence
+    # allow_unsigned_extensions. Deliberately not setting
+    # allow_extensions_metadata_mismatch: a build stamped for this platform does
+    # not need it, and leaving it off means a wrong-platform binary fails loudly
+    # instead of being loaded anyway.
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
-    con.execute("SET allow_extensions_metadata_mismatch=true;")
     con.execute(f"LOAD '{ext_path.as_posix()}';")
     return con
 
@@ -141,7 +190,9 @@ def main() -> None:
         nargs="?",
         help="example name to run, or 'all' for every example",
     )
-    parser.add_argument("--list", action="store_true", help="list example names and exit")
+    parser.add_argument(
+        "--list", action="store_true", help="list example names and exit"
+    )
     parser.add_argument(
         "--ext",
         type=Path,
