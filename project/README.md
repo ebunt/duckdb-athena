@@ -29,9 +29,16 @@ uv run project/bootstrap.py verify   # row counts, partitions, decimal total
 uv run project/bootstrap.py drop     # tables, database, and the S3 objects
 ```
 
-It needs no new bucket: it writes where Athena already writes its results.
-Override with `ATHENA_DEMO_LOCATION=s3://bucket/prefix/` or rename the database
-with `ATHENA_DEMO_DATABASE`.
+It needs no new bucket: it writes under the workgroup's own result prefix, so
+`s3://bucket/athena-results/` becomes
+`s3://bucket/athena-results/duckdb-athena-demo/` — an account that grants Athena
+users the result prefix and nothing else still works. Override with
+`ATHENA_DEMO_LOCATION=s3://bucket/prefix/`, or rename the database with
+`ATHENA_DEMO_DATABASE`.
+
+`drop` deletes only the `trips/` and `trips_by_month/` trees it created, not
+everything under the prefix — pointing `ATHENA_DEMO_LOCATION` at somewhere that
+already holds data is safe.
 
 The tables are deliberately shaped to exercise the extension rather than just to
 hold data: `total_decimal` is a real `DECIMAL(10,2)`, `is_disputed` a `BOOLEAN`,

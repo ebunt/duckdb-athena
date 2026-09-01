@@ -22,6 +22,17 @@ from pathlib import Path
 
 import duckdb
 
+
+def _session_region() -> str | None:
+    """The region the AWS config chain resolves, if boto3 is installed."""
+    try:
+        import boto3
+
+        return boto3.Session().region_name
+    except Exception:
+        return None
+
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_EXT = (
     REPO_ROOT / "build" / "release" / "extension" / "athena" / "athena.duckdb_extension"
@@ -38,6 +49,16 @@ DEFAULT_EXT = (
 # `output_location=` when ATHENA_OUTPUT_LOCATION is provided. Single quotes are
 # doubled to keep the embedded SQL string literal valid.
 DB = os.environ.get("ATHENA_DEMO_DATABASE", "duckdb_athena_demo")
+
+# Whatever region the session already resolves to, which is where
+# project/bootstrap.py will have created the database. boto3 is consulted last
+# so a profile's region counts, and only then does it fall back to us-east-1.
+REGION = (
+    os.environ.get("AWS_REGION")
+    or os.environ.get("AWS_DEFAULT_REGION")
+    or _session_region()
+    or "us-east-1"
+)
 
 OUTPUT = os.environ.get("ATHENA_OUTPUT_LOCATION")
 _OUT = f", output_location='{OUTPUT.replace(chr(39), chr(39) * 2)}'" if OUTPUT else ""
@@ -142,10 +163,12 @@ QUERIES: dict[str, str] = {
     """,
     # region= overrides whatever the AWS config chain resolved, so one session
     # can read tables in more than one region. profile= does the same for
-    # credentials.
+    # credentials. The region here is the one the demo database was created in
+    # -- hard-coding a region would send this example to the wrong regional Glue
+    # catalog for anyone who bootstrapped elsewhere.
     "region": f"""
         SELECT COUNT(*) AS trips
-        FROM athena_scan('trips'{_OUT}, database='{DB}', region='us-east-1')
+        FROM athena_scan('trips'{_OUT}, database='{DB}', region='{REGION}')
     """,
 }
 

@@ -87,29 +87,49 @@ SELECT_LIST = """
 """
 
 
-def location() -> str:
-    """Where the demo data lives, ending in a slash."""
+def location() -> tuple[str, str | None]:
+    """Where the demo data goes, and a result location if Athena needs one told.
+
+    Returns (prefix, result_config). `result_config` is None when the workgroup
+    already has its own result configuration, because passing one anyway
+    conflicts with a workgroup that enforces its settings.
+    """
     if explicit := os.environ.get("ATHENA_DEMO_LOCATION"):
-        return explicit.rstrip("/") + "/"
-    wg = boto3.client("athena").get_work_group(WorkGroup=WORKGROUP)["WorkGroup"]
-    output = (
-        wg.get("Configuration", {}).get("ResultConfiguration", {}).get("OutputLocation")
-    )
+        prefix = explicit.rstrip("/") + "/"
+        # The workgroup may still have no result location of its own, in which
+        # case every statement below needs one or Athena rejects it outright.
+        return prefix, None if workgroup_output() else f"{prefix}athena-results/"
+
+    output = workgroup_output()
     if not output:
         sys.exit(
             f"workgroup {WORKGROUP!r} has no result location, so there is nowhere "
             "obvious to put the demo data. Set ATHENA_DEMO_LOCATION=s3://bucket/prefix/"
         )
-    bucket = output.split("/")[2]
-    return f"s3://{bucket}/duckdb-athena-demo/"
+    # Append to the whole configured prefix rather than keeping only the bucket.
+    # Accounts commonly grant Athena users access to the result prefix and not
+    # to the bucket root, so `s3://bucket/athena-results/` must become
+    # `s3://bucket/athena-results/duckdb-athena-demo/`, not a sibling of it.
+    return output.rstrip("/") + "/duckdb-athena-demo/", None
 
 
-def athena(sql: str, *, database: str | None = None) -> str:
+def workgroup_output() -> str | None:
+    wg = boto3.client("athena").get_work_group(WorkGroup=WORKGROUP)["WorkGroup"]
+    return (
+        wg.get("Configuration", {})
+        .get("ResultConfiguration", {})
+        .get("OutputLocation")
+    )
+
+
+def athena(sql: str, *, database: str | None = None, results: str | None = None) -> str:
     """Run one statement and wait. Returns the execution id."""
     client = boto3.client("athena")
     kwargs: dict = {"QueryString": sql, "WorkGroup": WORKGROUP}
     if database:
         kwargs["QueryExecutionContext"] = {"Database": database}
+    if results:
+        kwargs["ResultConfiguration"] = {"OutputLocation": results}
     qid = client.start_query_execution(**kwargs)["QueryExecutionId"]
     while True:
         status = client.get_query_execution(QueryExecutionId=qid)["QueryExecution"][
@@ -126,10 +146,13 @@ def athena(sql: str, *, database: str | None = None) -> str:
     return qid
 
 
+RESULTS: str | None = None  # set by create()/verify()/drop() from location()
+
+
 def scalar(sql: str) -> str:
     """Run a query and return its single value."""
     client = boto3.client("athena")
-    qid = athena(sql, database=DATABASE)
+    qid = athena(sql, database=DATABASE, results=RESULTS)
     rows = client.get_query_results(QueryExecutionId=qid)["ResultSet"]["Rows"]
     return rows[1]["Data"][0].get("VarCharValue", "")
 
@@ -176,16 +199,16 @@ def upload(local: Path, prefix: str) -> int:
 
 def ddl(prefix: str) -> None:
     columns = ",\n  ".join(f"`{name}` {type_}" for name, type_ in COLUMNS)
-    athena(f"CREATE DATABASE IF NOT EXISTS {DATABASE}")
-    athena(f"DROP TABLE IF EXISTS {DATABASE}.trips")
-    athena(f"DROP TABLE IF EXISTS {DATABASE}.trips_by_month")
+    athena(f"CREATE DATABASE IF NOT EXISTS {DATABASE}", results=RESULTS)
+    athena(f"DROP TABLE IF EXISTS {DATABASE}.trips", results=RESULTS)
+    athena(f"DROP TABLE IF EXISTS {DATABASE}.trips_by_month", results=RESULTS)
     athena(f"""
         CREATE EXTERNAL TABLE {DATABASE}.trips (
           {columns}
         )
         STORED AS PARQUET
         LOCATION '{prefix}trips/'
-    """)
+    """, results=RESULTS)
     athena(f"""
         CREATE EXTERNAL TABLE {DATABASE}.trips_by_month (
           {columns}
@@ -193,14 +216,15 @@ def ddl(prefix: str) -> None:
         PARTITIONED BY (`yr` INT, `mn` INT)
         STORED AS PARQUET
         LOCATION '{prefix}trips_by_month/'
-    """)
+    """, results=RESULTS)
     # Without this the partitioned table reports zero rows: the data is on S3
     # but Glue has no partitions registered for it.
-    athena(f"MSCK REPAIR TABLE {DATABASE}.trips_by_month")
+    athena(f"MSCK REPAIR TABLE {DATABASE}.trips_by_month", results=RESULTS)
 
 
 def create() -> None:
-    prefix = location()
+    global RESULTS
+    prefix, RESULTS = location()
     print(f"database : {DATABASE}")
     print(f"location : {prefix}")
     with TemporaryDirectory() as tmp:
@@ -217,6 +241,9 @@ def create() -> None:
 
 
 def verify() -> None:
+    global RESULTS
+    if RESULTS is None:
+        _, RESULTS = location()
     print("\n-- verify")
     for table in ("trips", "trips_by_month"):
         print(f"  {table:15} {int(scalar(f'SELECT COUNT(*) FROM {table}')):>9,} rows")
@@ -228,20 +255,29 @@ def verify() -> None:
 
 
 def drop() -> None:
-    prefix = location()
-    athena(f"DROP TABLE IF EXISTS {DATABASE}.trips")
-    athena(f"DROP TABLE IF EXISTS {DATABASE}.trips_by_month")
-    athena(f"DROP DATABASE IF EXISTS {DATABASE}")
+    global RESULTS
+    prefix, RESULTS = location()
+    athena(f"DROP TABLE IF EXISTS {DATABASE}.trips", results=RESULTS)
+    athena(f"DROP TABLE IF EXISTS {DATABASE}.trips_by_month", results=RESULTS)
+    athena(f"DROP DATABASE IF EXISTS {DATABASE}", results=RESULTS)
+
+    # Only the two trees this script writes. Deleting everything under the
+    # prefix would take unrelated objects with it whenever ATHENA_DEMO_LOCATION
+    # points somewhere that already holds data -- which the documented override
+    # invites.
     bucket = prefix.split("/")[2]
     key_root = "/".join(prefix.split("/")[3:])
     s3 = boto3.client("s3")
     deleted = 0
-    pages = s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=key_root)
-    for page in pages:
-        keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
-        if keys:
-            s3.delete_objects(Bucket=bucket, Delete={"Objects": keys})
-            deleted += len(keys)
+    for table in ("trips", "trips_by_month"):
+        pages = s3.get_paginator("list_objects_v2").paginate(
+            Bucket=bucket, Prefix=f"{key_root}{table}/"
+        )
+        for page in pages:
+            keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+            if keys:
+                s3.delete_objects(Bucket=bucket, Delete={"Objects": keys})
+                deleted += len(keys)
     print(f"dropped {DATABASE} and deleted {deleted} objects under {prefix}")
 
 
