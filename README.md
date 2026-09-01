@@ -206,7 +206,7 @@ first and `profile=` would silently change nothing. Region resolves in the order
 chain. A profile that does not exist fails at bind, naming itself:
 
 ```
-Binder Error: table "sampledb"."elb_logs" in region us-east-1: dispatch failure:
+Binder Error: table "duckdb_athena_demo"."trips" in region us-east-1: dispatch failure:
 other: the credentials provider was not properly configured: ProfileFile
 provider could not be built: profile `nope` was not defined
 ```
@@ -221,9 +221,8 @@ age in minutes (Athena's own limit is 7 days):
 SELECT COUNT(*) FROM athena_scan('my_table', result_reuse_minutes=60);
 ```
 
-Measured on `sampledb.elb_logs`: the first run scanned 846 KB in 540 ms of
-engine time, the second scanned **0 bytes** in 154 ms and returned the same
-answer. Leave it off when the underlying data changes within the window.
+Measured on the demo table: the first run scanned 259.32 KB in 693 ms of engine
+time, the second scanned **0 bytes** in 147 ms and returned the same answer. Leave it off when the underlying data changes within the window.
 
 ### Bound how long a query may run
 
@@ -301,7 +300,8 @@ WHERE event_type = 'click';
 
 Athena writes each query's full result set as a single CSV object at the
 execution's result location, and the extension streams that object with one
-`GetObject`. Counting nyctaxi's 1,070,262 rows takes about 3 seconds:
+`GetObject`. Counting the demo table's 167,585 rows takes about two seconds,
+and the same approach returns a million rows in about three:
 
 ```sql
 SELECT COUNT(*) FROM athena_scan('my_table');
@@ -360,7 +360,7 @@ Lookup failures name the database, table and region, because a table in another
 region reports the same "Entity Not Found" as one that does not exist:
 
 ```
-Binder Error: table "sampledb"."no_such_table" in region us-east-1: EntityNotFoundException: Entity Not Found
+Binder Error: table "duckdb_athena_demo"."no_such_table" in region us-east-1: EntityNotFoundException: Entity Not Found
 ```
 
 `Run time` is Athena's engine time and excludes fetching the result.
