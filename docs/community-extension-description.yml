@@ -26,7 +26,7 @@ repo:
   # carries both the MIT file `license:` claims and the current behaviour --
   # here, the one where a refused stop_query_execution is reported rather than
   # swallowed. Repin when anything user-visible lands on main.
-  ref: f086c74cefceb6b57679135e94e13135e815d71a
+  ref: f807c6793f3a45b4faf82c84e03ec24418f6ce39
 
 docs:
   hello_world: |
@@ -60,7 +60,7 @@ docs:
       functions work on them.
 
     Named parameters: `database`, `maxrows`, `predicate`, `workgroup`,
-    `output_location`.
+    `output_location`, `region`, `timeout_seconds`, `result_reuse_minutes`.
 
     Required IAM: `athena:StartQueryExecution`, `athena:GetQueryExecution`,
     `athena:GetQueryResults`, `athena:StopQueryExecution`, `glue:GetTable`, and
