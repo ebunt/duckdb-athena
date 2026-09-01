@@ -3,8 +3,8 @@
 Runnable `athena_scan` examples against real Glue databases in this account
 (`us-east-1`). The table name is the only positional argument; everything else
 is named. The examples below omit `output_location`, so the extension derives
-the results S3 location from the workgroup's default (this account's `primary`
-workgroup is configured with `s3://ebunt-athena/athena-results/`). Pass
+the results S3 location from the workgroup's default (the `primary` workgroup
+needs one configured, e.g. `s3://<your-bucket>/athena-results/`). Pass
 `output_location='s3://...'` to override it, or `workgroup='name'` to use a
 different workgroup's default.
 

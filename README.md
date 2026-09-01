@@ -325,7 +325,7 @@ statistics when it finishes. In between, any query still running after three
 seconds reports a heartbeat, and repeats it every five seconds:
 
 ```
-Running Athena query, execution id: 7ef118ba-c4aa-4d39-af13-82775531716b
+Running Athena query, execution id: 00000000-0000-0000-0000-000000000000
 Athena query RUNNING, 4s elapsed, 1.31 GB scanned
 Time in queue: 97 ms
 Run time: 5050 ms
@@ -352,7 +352,7 @@ Errors carry Athena's own explanation rather than only the execution id, so the
 cause is in the terminal instead of the Athena console:
 
 ```
-Invalid Input Error: Athena query 891ed2c0-82bf-47a0-afa8-044cde50c2e7 Failed:
+Invalid Input Error: Athena query 00000000-0000-0000-0000-000000000000 Failed:
 INVALID_LITERAL: line 1:71: 'not-a-date' is not a valid TIMESTAMP literal
 ```
 
