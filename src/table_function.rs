@@ -503,161 +503,6 @@ fn validate_predicate(predicate: &str) -> Result<String, String> {
     Ok(predicate.to_owned())
 }
 
-/// Words that can appear bare in a `WHERE` expression without naming a column:
-/// operators, literals, and the type names used by casts and typed literals.
-/// Deliberately permissive — a word listed here is simply not checked, so the
-/// worst case is that a mistyped column slips through to Athena, which is where
-/// it would have been caught before this validation existed.
-const PREDICATE_WORDS: &[&str] = &[
-    "AND",
-    "OR",
-    "NOT",
-    "IN",
-    "IS",
-    "NULL",
-    "LIKE",
-    "BETWEEN",
-    "TRUE",
-    "FALSE",
-    "ESCAPE",
-    "CAST",
-    "AS",
-    "DISTINCT",
-    "ALL",
-    "ANY",
-    "SOME",
-    "EXISTS",
-    "CASE",
-    "WHEN",
-    "THEN",
-    "ELSE",
-    "END",
-    // Grammar words that appear inside expressions: EXTRACT(YEAR FROM ts),
-    // INTERVAL '1' DAY TO SECOND, ts AT TIME ZONE 'UTC', DOUBLE PRECISION.
-    "FROM",
-    "TO",
-    "AT",
-    "PRECISION",
-    "LOCAL",
-    "DATE",
-    "TIME",
-    "TIMESTAMP",
-    "INTERVAL",
-    "ZONE",
-    "YEAR",
-    "MONTH",
-    "DAY",
-    "HOUR",
-    "MINUTE",
-    "SECOND",
-    "VARCHAR",
-    "CHAR",
-    "BOOLEAN",
-    "TINYINT",
-    "SMALLINT",
-    "INTEGER",
-    "INT",
-    "BIGINT",
-    "REAL",
-    "DOUBLE",
-    "FLOAT",
-    "DECIMAL",
-    "ARRAY",
-    "MAP",
-    "ROW",
-    "JSON",
-    "VARBINARY",
-    "UUID",
-];
-
-/// Rejects a `predicate=` that references a column the table does not have.
-///
-/// Athena would reject it too, but only after `StartQueryExecution`, as an
-/// opaque `COLUMN_NOT_FOUND` on a query the user cannot see. Catching it at bind
-/// names the offending identifier and the columns that do exist.
-///
-/// This is a scan, not a parser: string literals are blanked first, a word
-/// followed by `(` is treated as a function name, and anything in
-/// `PREDICATE_WORDS` is skipped. Everything else must be a known column.
-fn validate_predicate_columns(predicate: &str, columns: &[String]) -> Result<(), String> {
-    let masked = mask_string_literals(predicate);
-    let known: Vec<String> = columns.iter().map(|c| c.to_ascii_lowercase()).collect();
-    let bytes: Vec<char> = masked.chars().collect();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        let c = bytes[i];
-
-        // Quoted identifier: "col name", with "" as an escaped quote.
-        if c == '"' {
-            let mut name = String::new();
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == '"' {
-                    if bytes.get(i + 1) == Some(&'"') {
-                        name.push('"');
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                name.push(bytes[i]);
-                i += 1;
-            }
-            check_identifier(&name, &known, columns)?;
-            continue;
-        }
-
-        if c.is_ascii_alphabetic() || c == '_' {
-            let start = i;
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == '_') {
-                i += 1;
-            }
-            let word: String = bytes[start..i].iter().collect();
-
-            // A word followed by "(" is a function call, not a column.
-            let mut j = i;
-            while j < bytes.len() && bytes[j].is_whitespace() {
-                j += 1;
-            }
-            let is_call = bytes.get(j) == Some(&'(');
-            let is_word = PREDICATE_WORDS.contains(&word.to_ascii_uppercase().as_str());
-            // A listed word standing directly before a comparison operator is an
-            // operand, not grammar, so it names a column: `year = 2024` is a
-            // column reference even though YEAR is also an EXTRACT unit. Without
-            // this, every keyword-shaped column name skips validation entirely.
-            let compared = matches!(bytes.get(j), Some('=' | '<' | '>' | '!'));
-
-            if !is_call && (!is_word || compared) {
-                check_identifier(&word, &known, columns)?;
-            }
-            continue;
-        }
-
-        // Skip numeric literals whole so 2024 or 1e6 never looks like an identifier.
-        if c.is_ascii_digit() {
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == '.') {
-                i += 1;
-            }
-            continue;
-        }
-
-        i += 1;
-    }
-    Ok(())
-}
-
-fn check_identifier(name: &str, known: &[String], columns: &[String]) -> Result<(), String> {
-    if known.contains(&name.to_ascii_lowercase()) {
-        return Ok(());
-    }
-    Err(format!(
-        "predicate references unknown column \"{name}\"; this table has: {}",
-        columns.join(", ")
-    ))
-}
-
 /// Builds the Athena `SELECT` list from the columns DuckDB actually projected.
 ///
 /// `indices` are positions into `columns` (the bind-time output schema), in the
@@ -975,15 +820,6 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
                 describe_target(&database, &tablename, region.as_deref(), &config)
             ));
             return;
-        }
-
-        // Column references can only be checked once the Glue schema is known,
-        // so this runs here rather than beside the rest of predicate validation.
-        if let Some(predicate) = predicate.as_deref() {
-            if let Err(e) = validate_predicate_columns(predicate, &columns) {
-                bi.set_error(&e);
-                return;
-            }
         }
 
         FfiBindData::<ScanBindData>::set(
@@ -1383,7 +1219,7 @@ mod tests {
         mask_string_literals, next_poll_delay, parse_optional_arg, parse_reuse_minutes,
         parse_timeout_seconds, progress_line, projected_select_list, qualified_table,
         result_output_location, result_row_cell, sleep_before_next_poll, timeout_message,
-        validate_predicate, validate_predicate_columns, POLL_INITIAL, POLL_MAX,
+        validate_predicate, POLL_INITIAL, POLL_MAX,
     };
     use crate::types::ColType;
     use aws_sdk_athena::operation::get_query_execution::GetQueryExecutionOutput;
@@ -1893,82 +1729,33 @@ mod tests {
     }
 
     #[test]
-    fn predicate_columns_accepts_references_the_table_has() {
-        let cols = cols();
-        assert!(validate_predicate_columns("year = 2024 AND name IS NOT NULL", &cols).is_ok());
-        // Athena lowercases unquoted identifiers, so matching is case-insensitive.
-        assert!(validate_predicate_columns("YEAR > 2000 OR Name LIKE 'a%'", &cols).is_ok());
-        // Quoted identifiers name columns too.
-        assert!(validate_predicate_columns("\"year\" BETWEEN 2000 AND 2024", &cols).is_ok());
-    }
-
-    #[test]
-    fn predicate_columns_rejects_a_column_the_table_lacks() {
-        // The point of the check: a typo becomes a bind error naming the column
-        // instead of an opaque Athena COLUMN_NOT_FOUND after the query starts.
-        let err = validate_predicate_columns("yaer = 2024", &cols()).unwrap_err();
-        assert!(err.contains("yaer"), "{err}");
-        assert!(err.contains("year"), "should list the real columns: {err}");
-        assert!(validate_predicate_columns("year = 2024 AND missing > 1", &cols()).is_err());
-    }
-
-    #[test]
-    fn predicate_columns_ignores_words_inside_string_literals() {
-        // 'New York' must not be read as a reference to a column named New.
-        assert!(validate_predicate_columns("name = 'New York'", &cols()).is_ok());
-        assert!(validate_predicate_columns("name = 'it''s year'", &cols()).is_ok());
-    }
-
-    #[test]
-    fn predicate_columns_allows_functions_literals_and_types() {
-        let cols = cols();
-        // A word before "(" is a function name, not a column.
-        assert!(validate_predicate_columns("lower(name) = 'x'", &cols).is_ok());
-        assert!(validate_predicate_columns("year(  id ) = 2024", &cols).is_ok());
-        // Typed literals, casts and keyword operands are not columns either.
-        assert!(validate_predicate_columns("id > CAST('1' AS BIGINT)", &cols).is_ok());
-        assert!(validate_predicate_columns("year >= DATE '2024-01-01'", &cols).is_ok());
-        assert!(validate_predicate_columns("id IN (1, 2, 3) AND name IS NULL", &cols).is_ok());
-        assert!(validate_predicate_columns("id = 1e6 OR id = 2.5", &cols).is_ok());
-    }
-
-    #[test]
-    fn predicate_columns_allows_sql_grammar_inside_expressions() {
-        // Regression: FROM inside EXTRACT was read as a column reference, so a
-        // valid predicate was rejected at bind unless the table happened to have
-        // a column named "from".
-        let cols = vec!["event_time".to_string(), "id".to_string()];
-        assert!(validate_predicate_columns("EXTRACT(YEAR FROM event_time) = 2024", &cols).is_ok());
-        assert!(validate_predicate_columns("id > CAST(1 AS DOUBLE PRECISION)", &cols).is_ok());
-        assert!(validate_predicate_columns(
-            "event_time AT TIME ZONE 'UTC' > TIMESTAMP '2024-01-01 00:00:00'",
-            &cols
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn predicate_columns_checks_keyword_shaped_names_that_are_compared() {
-        // YEAR is both an EXTRACT unit and a perfectly ordinary column name.
-        // Standing before a comparison it is an operand, so it gets checked.
-        let without = vec!["id".to_string()];
-        assert!(validate_predicate_columns("year = 2024", &without).is_err());
-        assert!(validate_predicate_columns("year>2024", &without).is_err());
-
-        let with = vec!["year".to_string()];
-        assert!(validate_predicate_columns("year = 2024", &with).is_ok());
-
-        // ...but the same words in grammar positions are still not columns.
-        assert!(validate_predicate_columns("id IS NOT NULL", &without).is_ok());
-        assert!(validate_predicate_columns("id > DATE '2024-01-01'", &without).is_ok());
-    }
-
-    #[test]
     fn validate_predicate_accepts_simple_where_expression() {
         assert_eq!(
             validate_predicate(" year = 2024 AND event_type = 'click' ").unwrap(),
             "year = 2024 AND event_type = 'click'"
         );
+    }
+
+    #[test]
+    fn valid_sql_is_not_rejected_for_looking_unfamiliar() {
+        // This is why the column checker is gone. It carried a 60-word grammar,
+        // and every word missing from that list was valid SQL refused before
+        // Athena ever saw it: `EXTRACT(year FROM col)` was rejected outright
+        // until FROM/TO/AT/PRECISION/LOCAL were added, and the next gap would
+        // have been found the same way -- by a user with a working query.
+        //
+        // Athena rejects an unknown column itself in ~555ms for 0 bytes, with
+        // `COLUMN_NOT_FOUND: Column 'x' cannot be resolved`, and that reason is
+        // surfaced verbatim. What remains here is only what Athena would not
+        // catch: an expression shaped like a second statement.
+        for ok in [
+            "EXTRACT(year FROM ts) = 2024",
+            "ts AT TIME ZONE 'UTC' > TIMESTAMP '2024-01-01 00:00:00'",
+            "CAST(x AS DOUBLE PRECISION) > 1",
+            "nosuchcolumn = 1",
+        ] {
+            assert!(validate_predicate(ok).is_ok(), "{ok} should reach Athena");
+        }
     }
 
     #[test]
