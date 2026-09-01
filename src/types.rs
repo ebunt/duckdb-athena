@@ -25,8 +25,23 @@ pub enum ColType {
 // Maps Athena/Glue data types to DuckDB types.
 // Only returns non-Varchar types when populate_column can write them correctly.
 // Supported types are listed here: https://docs.aws.amazon.com/athena/latest/ug/data-types.html
+/// Athena writes booleans as `true`/`false`; anything else means the value did
+/// not survive the round trip, so it is NULL rather than a guess.
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim() {
+        v if v.eq_ignore_ascii_case("true") => Some(true),
+        v if v.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
+    }
+}
+
 pub fn map_type(col_type: &str) -> Result<ColType, String> {
-    let col_type = ColType::Simple(match col_type {
+    // Glue is not consistent about case or whitespace, and spells sized types
+    // `varchar(256)` / `char(10)`. Matched raw, all of those miss every arm and
+    // land on the caller's Varchar fallback -- harmless for a string, wrong for
+    // an `Int` that should have been INTEGER.
+    let normalized = col_type.trim().to_ascii_lowercase();
+    let col_type = ColType::Simple(match normalized.as_str() {
         "boolean" => TypeId::Boolean,
         "tinyint" => TypeId::TinyInt,
         "smallint" => TypeId::SmallInt,
@@ -43,7 +58,11 @@ pub fn map_type(col_type: &str) -> Result<ColType, String> {
         // is the Hive default DECIMAL(10,0)). Registered as a native DECIMAL so
         // values keep numeric typing instead of coming back as strings.
         s if s == "decimal" || s.starts_with("decimal(") => return parse_decimal(s),
-        "string" | "varchar" | "char" => TypeId::Varchar,
+        // Sized string types carry a length Glue enforces and DuckDB does not
+        // need: `varchar(256)` is still a VARCHAR here. Binary has no DuckDB
+        // counterpart in this extension and stays text.
+        "string" | "varchar" | "char" | "binary" | "varbinary" => TypeId::Varchar,
+        s if s.starts_with("varchar(") || s.starts_with("char(") => TypeId::Varchar,
         // Complex types are requested as JSON rather than Athena's ambiguous
         // default text -- but only when Athena can actually perform the cast,
         // since a rejected cast fails the whole query. Glue spells them
@@ -303,7 +322,14 @@ pub unsafe fn populate_column(
         };
 
         match type_id {
-            TypeId::Boolean => writer.write_bool(row_idx, value.eq_ignore_ascii_case("true")),
+            // Anything that is not true/false is unknown, not false. The old
+            // `== "true"` turned "1", "t" and any garbage into a confident
+            // `false` -- a wrong answer is worse than a missing one, and it
+            // survives aggregation silently.
+            TypeId::Boolean => match parse_bool(value) {
+                Some(b) => writer.write_bool(row_idx, b),
+                None => writer.set_null(row_idx),
+            },
             TypeId::BigInt => match value.parse::<i64>() {
                 Ok(v) => writer.write_i64(row_idx, v),
                 Err(_) => writer.set_null(row_idx),
@@ -346,9 +372,75 @@ pub unsafe fn populate_column(
 #[cfg(test)]
 mod tests {
     use super::{
-        decimal_fits, map_type, parse_date, parse_decimal_value, parse_timestamp, ColType,
+        decimal_fits, map_type, parse_bool, parse_date, parse_decimal_value, parse_timestamp,
+        ColType,
     };
     use quack_rs::types::TypeId;
+
+    #[test]
+    fn glue_type_spelling_does_not_change_the_duckdb_type() {
+        // Glue is inconsistent about case and whitespace. Matched raw, every one
+        // of these missed and fell back to Varchar at the call site -- fine for
+        // a string, but an `Int` column silently arriving as VARCHAR breaks
+        // arithmetic in DuckDB for no visible reason.
+        assert_eq!(
+            map_type("Int").unwrap(),
+            ColType::Simple(TypeId::Integer),
+            "mixed case"
+        );
+        assert_eq!(
+            map_type("  BIGINT  ").unwrap(),
+            ColType::Simple(TypeId::BigInt),
+            "surrounding whitespace"
+        );
+        assert_eq!(
+            map_type("STRING").unwrap(),
+            ColType::Simple(TypeId::Varchar)
+        );
+        assert_eq!(
+            map_type("DECIMAL(10,2)").unwrap(),
+            ColType::Decimal {
+                width: 10,
+                scale: 2
+            },
+            "case must not cost a column its native DECIMAL"
+        );
+    }
+
+    #[test]
+    fn sized_string_and_binary_types_are_varchar() {
+        // Glue spells these with a length DuckDB does not need. Binary has no
+        // counterpart here and stays text rather than erroring.
+        for t in ["varchar(256)", "VARCHAR(65535)", "char(10)", "CHAR(1)"] {
+            assert_eq!(
+                map_type(t).unwrap(),
+                ColType::Simple(TypeId::Varchar),
+                "{t}"
+            );
+        }
+        assert_eq!(
+            map_type("binary").unwrap(),
+            ColType::Simple(TypeId::Varchar)
+        );
+        assert_eq!(
+            map_type("varbinary").unwrap(),
+            ColType::Simple(TypeId::Varchar)
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_boolean_is_null_not_false() {
+        // The bug this replaces: `value == "true"` made every other spelling a
+        // confident `false`. A wrong answer is worse than a missing one --
+        // COUNT(*) WHERE flag = false silently included the unparseable rows.
+        assert_eq!(parse_bool("true"), Some(true));
+        assert_eq!(parse_bool("TRUE"), Some(true));
+        assert_eq!(parse_bool("false"), Some(false));
+        assert_eq!(parse_bool(" False "), Some(false));
+        for junk in ["1", "0", "t", "f", "yes", "", "null"] {
+            assert_eq!(parse_bool(junk), None, "{junk} is unknown, not false");
+        }
+    }
 
     #[test]
     fn map_type_maps_temporal_natively() {

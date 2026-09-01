@@ -246,6 +246,26 @@ const MAX_RESULT_REUSE_MINUTES: i32 = 7 * 24 * 60;
 /// How long to sleep before the next state check: the backoff, but never past
 /// the deadline. Without the clamp a 5s backoff can overshoot a short timeout by
 /// almost 5s, so `timeout_seconds` would not bound the wait it promises to.
+/// Athena's own explanation for a failed or cancelled query, when it gave one.
+fn reason(resp: &GetQueryExecutionOutput) -> Option<&str> {
+    resp.query_execution()
+        .and_then(|qe| qe.status())
+        .and_then(|s| s.state_change_reason())
+}
+
+/// The error text for a query Athena failed or cancelled.
+///
+/// `StateChangeReason` is where the actual cause lives -- the syntax error, the
+/// denied permission, the exhausted resource. Without it the message is just
+/// `Query Failed: <id>`, which sends the reader to the Athena console to find
+/// out what this process already knew.
+fn failure_message(id: &str, state: &str, reason: Option<&str>) -> String {
+    match reason {
+        Some(r) => format!("Athena query {id} {state}: {r}"),
+        None => format!("Athena query {id} {state} (Athena gave no reason)"),
+    }
+}
+
 /// The error text for a query that outlived `timeout_seconds=`.
 ///
 /// A failed stop is not a footnote: the timeout promises to stop the query, and
@@ -1050,7 +1070,21 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
         let start_resp = crate::RUNTIME.block_on(request.send());
 
         let query_execution_id = match start_resp {
-            Ok(r) => r.query_execution_id().unwrap_or_default().to_string(),
+            Ok(r) => match r.query_execution_id().filter(|id| !id.is_empty()) {
+                Some(id) => id.to_string(),
+                // Polling "" would loop against a nonexistent execution until
+                // the timeout and then blame the timeout. Athena should never
+                // do this, but unwrap_or_default() turned "should never" into
+                // an hour-long wait for a wrong error.
+                None => {
+                    let msg = CString::new(
+                        "Athena accepted the query but returned no execution id".to_string(),
+                    )
+                    .unwrap_or_default();
+                    libduckdb_sys::duckdb_init_set_error(info, msg.as_ptr());
+                    return;
+                }
+            },
             Err(e) => {
                 // Include the workgroup: the usual cause is a workgroup with no
                 // result configuration and no output_location given, and the
@@ -1127,7 +1161,8 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
                     poll_delay = next_poll_delay(poll_delay, POLL_MAX);
                 }
                 Cancelled | Failed => {
-                    let msg = format!("Query {:?}: {}", state, query_execution_id);
+                    let msg =
+                        failure_message(&query_execution_id, &format!("{state:?}"), reason(&resp));
                     let c_msg = CString::new(msg).unwrap_or_default();
                     libduckdb_sys::duckdb_init_set_error(info, c_msg.as_ptr());
                     return;
@@ -1186,11 +1221,11 @@ pub fn build_table_function_def() -> TableFunctionBuilder {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_athena_query, datum_row_to_result_row, describe_target, mask_string_literals,
-        next_poll_delay, parse_optional_arg, parse_reuse_minutes, parse_timeout_seconds,
-        projected_select_list, qualified_table, result_output_location, result_row_cell,
-        sleep_before_next_poll, timeout_message, validate_predicate, validate_predicate_columns,
-        POLL_INITIAL, POLL_MAX,
+        build_athena_query, datum_row_to_result_row, describe_target, failure_message,
+        mask_string_literals, next_poll_delay, parse_optional_arg, parse_reuse_minutes,
+        parse_timeout_seconds, projected_select_list, qualified_table, result_output_location,
+        result_row_cell, sleep_before_next_poll, timeout_message, validate_predicate,
+        validate_predicate_columns, POLL_INITIAL, POLL_MAX,
     };
     use crate::types::ColType;
     use aws_sdk_athena::operation::get_query_execution::GetQueryExecutionOutput;
@@ -1311,6 +1346,29 @@ mod tests {
         assert_eq!(
             describe_target("db", "t", None, &config_with_region(None)),
             "table \"db\".\"t\" in region <no region configured>"
+        );
+    }
+
+    #[test]
+    fn a_failed_query_carries_athenas_own_reason() {
+        // Without StateChangeReason the error is "Query Failed: <id>", which
+        // sends the reader to the Athena console to learn what this process
+        // already had in hand.
+        let with = failure_message(
+            "abc",
+            "FAILED",
+            Some("SYNTAX_ERROR: line 1:8: Column 'x' cannot be resolved"),
+        );
+        assert!(with.contains("abc"), "{with}");
+        assert!(with.contains("FAILED"), "{with}");
+        assert!(with.contains("cannot be resolved"), "{with}");
+
+        // And when Athena gives nothing, say that rather than implying silence
+        // is the reason.
+        let without = failure_message("abc", "CANCELLED", None);
+        assert_eq!(
+            without,
+            "Athena query abc CANCELLED (Athena gave no reason)"
         );
     }
 
