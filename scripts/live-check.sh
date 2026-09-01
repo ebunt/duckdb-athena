@@ -14,13 +14,17 @@
 #   scripts/live-check.sh [path/to/athena.duckdb_extension]
 #
 # Requires: AWS credentials, duckdb and aws CLIs, and read access to the
-# sampledb and nyctaxi databases in us-east-1.
+# the demo database project/bootstrap.py creates. Build it first with
+#     uv run project/bootstrap.py create
 
 set -uo pipefail
 
 EXTENSION="${1:-build/release/extension/athena/athena.duckdb_extension}"
 export AWS_REGION="${AWS_REGION:-us-east-1}"
 WORKGROUP="${ATHENA_WORKGROUP:-primary}"
+# The database project/bootstrap.py creates. Override to point the checks at a
+# differently-named copy.
+DB="${ATHENA_DEMO_DATABASE:-duckdb_athena_demo}"
 
 if [ ! -f "$EXTENSION" ]; then
     echo "no extension at $EXTENSION -- run make first" >&2
@@ -34,9 +38,12 @@ fail=0
 # Reports one comparison. Keeping expected/actual in the output means a failure
 # says what diverged, not just that something did.
 check() {
-    local name="$1" expected="$2" actual="$3"
+    local name="$1" expected="$2" actual="$3" summary="${4:-}"
     if [ "$expected" = "$actual" ]; then
-        printf 'ok   %-42s %s\n' "$name" "$actual"
+        # A fourth argument replaces the value in the success line: some checks
+        # compare kilobytes of concatenated rows, and printing that on success
+        # buries every other result.
+        printf 'ok   %-42s %s\n' "$name" "${summary:-$actual}"
         pass=$((pass + 1))
     else
         printf 'FAIL %-42s expected %s, got %s\n' "$name" "$expected" "$actual"
@@ -77,49 +84,56 @@ echo "region:    $AWS_REGION"
 echo
 
 echo "-- value parity: extension vs Athena computing the same aggregate"
-for expr in "COUNT(*)" "COUNT(url)" "SUM(sentbytes)" "MIN(timestamp)" "MAX(timestamp)" \
-    "COUNT(DISTINCT elbresponsecode)"; do
-    check "elb_logs $expr" \
-        "$(athena "SELECT CAST($expr AS VARCHAR) FROM sampledb.elb_logs")" \
-        "$(duck "SELECT CAST($expr AS VARCHAR) FROM athena_scan('elb_logs', database='sampledb');")"
+# SUM(total_decimal) is the one that earns its place twice over: DECIMAL is the
+# only type with a two-part registration (width and scale) and a hand-written
+# value path, and a wrong scale is silent -- the number just comes back off by a
+# factor of ten. Deliberately no CAST in the DuckDB side: a cast would hide a
+# decimal that arrived as VARCHAR, which is the failure being checked for.
+for expr in "COUNT(*)" "COUNT(trip_distance)" "SUM(trip_distance)" "CAST(MIN(pickup_datetime) AS DATE)" "CAST(MAX(pickup_datetime) AS DATE)" \
+    "COUNT(DISTINCT payment_type)" "SUM(total_decimal)" "COUNT(*) FILTER (WHERE is_disputed)"; do
+    # Athena has no FILTER clause; count_if is its equivalent.
+    athena_expr="${expr/COUNT(*) FILTER (WHERE is_disputed)/COUNT_IF(is_disputed)}"
+    check "trips $expr" \
+        "$(athena "SELECT CAST($athena_expr AS VARCHAR) FROM $DB.trips")" \
+        "$(duck "SELECT CAST($expr AS VARCHAR) FROM athena_scan('trips', database='$DB');")"
 done
 
 echo
 echo "-- a full scan finishes, and reads the result from S3 rather than paging"
 start=$(date +%s)
-rows=$(duck "SELECT COUNT(*) FROM athena_scan('data', database='nyctaxi');")
+rows=$(duck "SELECT COUNT(*) FROM athena_scan('trips', database='$DB');")
 elapsed=$(($(date +%s) - start))
-check "nyctaxi COUNT(*)" "$(athena "SELECT CAST(COUNT(*) AS VARCHAR) FROM nyctaxi.data")" "$rows"
+check "trips COUNT(*)" "$(athena "SELECT CAST(COUNT(*) AS VARCHAR) FROM $DB.trips")" "$rows"
 # Paging 1.07M rows took ~135s; reading the result object takes seconds. A large
 # regression here means the S3 path silently stopped being used.
 if [ "$elapsed" -lt 60 ]; then
-    printf 'ok   %-42s %ss\n' "nyctaxi COUNT(*) under 60s" "$elapsed"
+    printf 'ok   %-42s %ss\n' "trips COUNT(*) under 60s" "$elapsed"
     pass=$((pass + 1))
 else
     printf 'FAIL %-42s %ss -- likely fell back to GetQueryResults paging\n' \
-        "nyctaxi COUNT(*) under 60s" "$elapsed"
+        "trips COUNT(*) under 60s" "$elapsed"
     fail=$((fail + 1))
 fi
 
 echo
 echo "-- pushdown and bounds reach Athena, not just DuckDB"
 check "maxrows caps the Athena query" "137" \
-    "$(duck "SELECT COUNT(*) FROM athena_scan('elb_logs', database='sampledb', maxrows=137);")"
+    "$(duck "SELECT COUNT(*) FROM athena_scan('trips', database='$DB', maxrows=137);")"
 check "predicate filters in Athena" \
-    "$(athena "SELECT CAST(COUNT(*) AS VARCHAR) FROM sampledb.elb_logs WHERE elbresponsecode = '404'")" \
-    "$(duck "SELECT COUNT(*) FROM athena_scan('elb_logs', database='sampledb', predicate='elbresponsecode = ''404''');")"
+    "$(athena "SELECT CAST(COUNT(*) AS VARCHAR) FROM $DB.trips WHERE passenger_count = 6")" \
+    "$(duck "SELECT COUNT(*) FROM athena_scan('trips', database='$DB', predicate='passenger_count = 6');")"
 
 # Projection pushdown is only observable in the SQL Athena received: the row
 # count is identical either way. Checking the value alone is what let a broken
 # COUNT(*) look verified in v0.2.2.
-duck "SELECT COUNT(url) FROM athena_scan('elb_logs', database='sampledb');" > /dev/null
+duck "SELECT COUNT(trip_distance) FROM athena_scan('trips', database='$DB');" > /dev/null
 # --max-items makes the CLI append its pagination token as a second line, so
 # keep only the id.
 sent=$(aws athena list-query-executions --work-group "$WORKGROUP" --max-items 1 \
     --query 'QueryExecutionIds[0]' --output text | head -1)
 sql=$(aws athena get-query-execution --query-execution-id "$sent" \
     --query 'QueryExecution.Query' --output text)
-if [ "$sql" = 'SELECT "url" FROM "sampledb"."elb_logs"' ]; then
+if [ "$sql" = "SELECT \"trip_distance\" FROM \"$DB\".\"trips\"" ]; then
     printf 'ok   %-42s %s\n' "projection pushdown in sent SQL" "$sql"
     pass=$((pass + 1))
 else
@@ -132,7 +146,7 @@ echo "-- partitioned tables: column order, metadata-only reads, pruning"
 # Glue keeps partition keys separate from data columns, and Athena returns them
 # last in SELECT *; bind has to register them in that order or every value lands
 # in the wrong column. Needs a partitioned fixture, so it is skipped when absent.
-PART_TABLE="${ATHENA_TEST_PARTITIONED_TABLE:-default.claude_part_test}"
+PART_TABLE="${ATHENA_TEST_PARTITIONED_TABLE:-$DB.trips_by_month}"
 part_db="${PART_TABLE%%.*}"
 part_tbl="${PART_TABLE##*.}"
 if aws glue get-table --database-name "$part_db" --name "$part_tbl" > /dev/null 2>&1; then
@@ -151,17 +165,25 @@ if aws glue get-table --database-name "$part_db" --name "$part_tbl" > /dev/null 
         );")
     check "partition columns come last" "$expected" "$actual"
 
-    # Every column of every row, concatenated in schema order and compared with
-    # Athena's own answer: this is what catches values landing in the wrong
-    # column, which is the failure a schema-only check sails past.
+    # Every column of a bounded sample of rows, concatenated in schema order and
+    # compared with Athena's own answer: this is what catches values landing in
+    # the wrong column, which a schema-only check sails past. Bounded because
+    # the comparison string is the whole sample -- over a full table it is
+    # megabytes of shell variable and unreadable when it fails.
     row_expr=""
     for c in $(echo "$expected" | tr ',' ' '); do
         [ -n "$row_expr" ] && row_expr="$row_expr || '|' || "
         row_expr="${row_expr}COALESCE(CAST(\"$c\" AS VARCHAR), '')"
     done
+    sample="ORDER BY $row_expr LIMIT 20"
+    # Athena renders a TIMESTAMP with a millisecond field, DuckDB without, so
+    # the same instant prints two ways. Strip a trailing .000 only where it ends
+    # a field, which no other column here can produce -- the DECIMAL is 2dp.
+    same_instant() { sed -E 's/\.000(\||$)/\1/g'; }
     check "partition table rows match Athena" \
-        "$(athena "SELECT array_join(array_agg($row_expr ORDER BY $row_expr), ';') FROM $part_db.$part_tbl")" \
-        "$(duck "SELECT string_agg($row_expr, ';' ORDER BY $row_expr) FROM athena_scan('$part_tbl', database='$part_db');")"
+        "$(athena "SELECT array_join(array_agg(r ORDER BY r), ';') FROM (SELECT $row_expr AS r FROM $part_db.$part_tbl $sample)" | same_instant)" \
+        "$(duck "SELECT string_agg(r, ';' ORDER BY r) FROM (SELECT $row_expr AS r FROM athena_scan('$part_tbl', database='$part_db') $sample);" | same_instant)" \
+        "20 sampled rows identical, every column"
 
     # Selecting only a partition column should not read the data files: the
     # values live in the catalog. Compared against a full scan rather than
@@ -200,14 +222,14 @@ echo "-- region= and result reuse"
 # region= must beat the ambient region, so run with a deliberately wrong
 # AWS_REGION and let the parameter correct it.
 check "region= overrides AWS_REGION" \
-    "$(athena "SELECT CAST(COUNT(*) AS VARCHAR) FROM sampledb.elb_logs")" \
+    "$(athena "SELECT CAST(COUNT(*) AS VARCHAR) FROM $DB.trips")" \
     "$(AWS_REGION=eu-west-1 duckdb -unsigned -noheader -list -c "LOAD '$EXTENSION';
-        SELECT COUNT(*) FROM athena_scan('elb_logs', database='sampledb', region='$AWS_REGION');" 2>/dev/null)"
+        SELECT COUNT(*) FROM athena_scan('trips', database='$DB', region='$AWS_REGION');" 2>/dev/null)"
 
 # Reuse is only observable in the execution record: the answer is identical
 # either way, so assert on ReusedPreviousResult and bytes scanned instead.
 reuse_run() {
-    duck "SELECT COUNT(url) FROM athena_scan('elb_logs', database='sampledb', result_reuse_minutes=60);" > /dev/null
+    duck "SELECT COUNT(trip_distance) FROM athena_scan('trips', database='$DB', result_reuse_minutes=60);" > /dev/null
     aws athena get-query-execution --query-execution-id \
         "$(aws athena list-query-executions --work-group "$WORKGROUP" --max-items 1 \
             --query 'QueryExecutionIds[0]' --output text | head -1)" \
@@ -225,7 +247,7 @@ echo "-- an unknown predicate column fails, with Athena's own reason"
 # names the column. What matters is that the reason reaches the user rather than
 # an opaque "Query Failed", so this asserts on the text, not just the failure.
 err=$(duckdb -unsigned -c "LOAD '$EXTENSION';
-    SELECT 1 FROM athena_scan('elb_logs', database='sampledb', predicate='nosuchcol = 1');" 2>&1 || true)
+    SELECT 1 FROM athena_scan('trips', database='$DB', predicate='nosuchcol = 1');" 2>&1 || true)
 case "$err" in
     *COLUMN_NOT_FOUND*nosuchcol*)
         printf 'ok   %-42s %s\n' "unknown predicate column" "Athena reason surfaced"

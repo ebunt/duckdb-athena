@@ -61,7 +61,9 @@ LOAD 'build/release/extension/athena/athena.duckdb_extension';
 
 ## Live checks
 
-`scripts/live-check.sh [path/to/extension]` runs the extension against real Athena and compares each answer with Athena computing the same thing natively (17 checks; needs credentials, so CI cannot run it). Three of them need a partitioned fixture table and are skipped without one — set `ATHENA_TEST_PARTITIONED_TABLE` (default `default.claude_part_test`). Run it before cutting a release. It asserts on the SQL Athena received where the value alone would not prove anything — projection pushdown being the case in point.
+`scripts/live-check.sh [path/to/extension]` runs the extension against real Athena and compares each answer with Athena computing the same thing natively (19 checks; needs credentials, so CI cannot run it). Run it before cutting a release. It asserts on the SQL Athena received where the value alone would not prove anything — projection pushdown being the case in point.
+
+It reads the database `uv run project/bootstrap.py create` builds: three months of NYC green taxi trips fetched from the TLC's CDN and written to the workgroup's own result bucket, as `duckdb_athena_demo.trips` plus a partitioned `trips_by_month`. That is deliberate — the checks used to depend on tables that existed only in one account, so nobody else could run them. The tables carry a real `DECIMAL(10,2)`, a `BOOLEAN` and `TIMESTAMP`s so the type mapping is exercised end to end rather than only in unit tests. Override the name with `ATHENA_DEMO_DATABASE`, or point the partition checks elsewhere with `ATHENA_TEST_PARTITIONED_TABLE`.
 
 ## Testing
 
@@ -98,7 +100,7 @@ reach the user as `Binder Error: <message>` from bind and `Invalid Input Error:
 <message>` from init. Verified, not assumed:
 
 ```
-Binder Error: table "sampledb"."no_such_table" in region us-east-1: EntityNotFoundException: Entity Not Found
+Binder Error: table "duckdb_athena_demo"."no_such_table" in region us-east-1: EntityNotFoundException: Entity Not Found
 Binder Error: database must not be empty; omit it to use the default
 Invalid Input Error: Athena query 891ed2c0-... Failed: INVALID_LITERAL: line 1:71: 'not-a-date' is not a valid TIMESTAMP literal
 ```

@@ -22,30 +22,42 @@ from pathlib import Path
 
 import duckdb
 
+
+def _session_region() -> str | None:
+    """The region the AWS config chain resolves, if boto3 is installed."""
+    try:
+        import boto3
+
+        return boto3.Session().region_name
+    except Exception:
+        return None
+
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_EXT = (
     REPO_ROOT / "build" / "release" / "extension" / "athena" / "athena.duckdb_extension"
 )
 
+# Everything below reads the database `project/bootstrap.py` creates, so these
+# examples run in any AWS account rather than only where the author's catalog
+# happens to exist. Build it first:
+#
+#     uv run project/bootstrap.py create
+#
 # Optional explicit Athena results location. When unset, athena_scan uses the
-# workgroup's default result configuration, so the queries below only add
+# workgroup's default result configuration, so the queries only add
 # `output_location=` when ATHENA_OUTPUT_LOCATION is provided. Single quotes are
 # doubled to keep the embedded SQL string literal valid.
-# Partitioned fixture for the `partitioned` example; override if yours differs.
-# The pruning predicate is only known for the default fixture -- someone else's
-# partitioned table has different key names, and a wrong one now fails at bind
-# with an unknown-column error. So: ask for it, and omit it when not given.
-DEFAULT_PART_TABLE = "default.claude_part_test"
-PART_SPEC = os.environ.get("ATHENA_PARTITIONED_TABLE", DEFAULT_PART_TABLE)
-PART_DB, _, PART_TABLE = PART_SPEC.partition(".")
-PART_PREDICATE = os.environ.get(
-    "ATHENA_PARTITIONED_PREDICATE",
-    "yr = 2024" if PART_SPEC == DEFAULT_PART_TABLE else "",
-)
-_PART_PRED = (
-    f", predicate='{PART_PREDICATE.replace(chr(39), chr(39) * 2)}'"
-    if PART_PREDICATE
-    else ""
+DB = os.environ.get("ATHENA_DEMO_DATABASE", "duckdb_athena_demo")
+
+# Whatever region the session already resolves to, which is where
+# project/bootstrap.py will have created the database. boto3 is consulted last
+# so a profile's region counts, and only then does it fall back to us-east-1.
+REGION = (
+    os.environ.get("AWS_REGION")
+    or os.environ.get("AWS_DEFAULT_REGION")
+    or _session_region()
+    or "us-east-1"
 )
 
 OUTPUT = os.environ.get("ATHENA_OUTPUT_LOCATION")
@@ -53,100 +65,110 @@ _OUT = f", output_location='{OUTPUT.replace(chr(39), chr(39) * 2)}'" if OUTPUT e
 
 # Named examples, mirroring QUERIES.md. Keys are what you pass on the CLI.
 QUERIES: dict[str, str] = {
-    # maxrows caps the Athena query with LIMIT — without it a bare SELECT * over
-    # the full nyctaxi table materializes every row before returning and looks
-    # like a hang. A plain DuckDB LIMIT would not help (no limit pushdown).
-    "taxi_basic": f"""
-        SELECT * FROM athena_scan('data'{_OUT}, database='nyctaxi', maxrows=10)
+    # maxrows caps the Athena query with LIMIT -- without it a bare SELECT *
+    # returns every row. A plain DuckDB LIMIT would not help: there is no limit
+    # pushdown, so Athena would still return everything.
+    "basic": f"""
+        SELECT * FROM athena_scan('trips'{_OUT}, database='{DB}', maxrows=10)
     """,
-    "taxi_projection": f"""
+    # Only the referenced columns are selected from Athena. On Parquet that
+    # directly reduces data_scanned_in_bytes, which is what Athena bills for.
+    "projection": f"""
         SELECT trip_distance, total_amount
-        FROM athena_scan('data'{_OUT}, database='nyctaxi')
+        FROM athena_scan('trips'{_OUT}, database='{DB}')
     """,
-    # An unbounded count over 1.07M rows, back in seconds: the result is
-    # streamed from the single CSV Athena writes to S3 rather than paged 1000
-    # rows at a time. DuckDB keeps one placeholder column for COUNT(*), so this
-    # reads one column of every row.
-    "taxi_count": f"""
+    # An unbounded count, back in seconds: the result is streamed from the
+    # single CSV Athena writes to S3 rather than paged 1000 rows at a time.
+    "count": f"""
         SELECT COUNT(*) AS trips
-        FROM athena_scan('data'{_OUT}, database='nyctaxi')
+        FROM athena_scan('trips'{_OUT}, database='{DB}')
     """,
-    "taxi_avg_tip": f"""
+    "avg_tip": f"""
         SELECT payment_type,
                COUNT(*)                  AS trips,
                ROUND(AVG(tip_amount), 2) AS avg_tip
-        FROM athena_scan('data'{_OUT}, database='nyctaxi')
+        FROM athena_scan('trips'{_OUT}, database='{DB}')
         GROUP BY payment_type
         ORDER BY trips DESC
+    """,
+    # DECIMAL(10,2) maps to a native DuckDB DECIMAL, so this sums without a
+    # cast and without float drift -- compare with SUM(total_amount), which is
+    # the same money as a DOUBLE.
+    "decimal": f"""
+        SELECT ROUND(SUM(total_decimal), 2) AS exact_total,
+               ROUND(SUM(total_amount), 2)  AS float_total
+        FROM athena_scan('trips'{_OUT}, database='{DB}')
+    """,
+    # Booleans that do not parse become NULL rather than false, so a three-way
+    # count is meaningful: true, false, and unknown.
+    "booleans": f"""
+        SELECT COUNT(*) FILTER (WHERE is_disputed)          AS disputed,
+               COUNT(*) FILTER (WHERE NOT is_disputed)      AS not_disputed,
+               COUNT(*) FILTER (WHERE is_disputed IS NULL)  AS unknown
+        FROM athena_scan('trips'{_OUT}, database='{DB}')
+    """,
+    # TIMESTAMP arrives as a native DuckDB timestamp, so date functions work
+    # without parsing strings.
+    "by_hour": f"""
+        SELECT EXTRACT(hour FROM pickup_datetime) AS hour_of_day,
+               COUNT(*)                           AS trips
+        FROM athena_scan('trips'{_OUT}, database='{DB}')
+        GROUP BY 1
+        ORDER BY trips DESC
+        LIMIT 5
     """,
     # predicate= is evaluated by Athena, so it cuts what is scanned and
     # returned. A plain DuckDB WHERE cannot: the C extension API exposes no
     # filter pushdown (duckdb/duckdb#25163).
-    "taxi_predicate": f"""
+    "predicate": f"""
         SELECT vendorid, passenger_count, total_amount
-        FROM athena_scan('data'{_OUT}, database='nyctaxi',
-                         predicate='passenger_count = 9')
+        FROM athena_scan('trips'{_OUT}, database='{DB}',
+                         predicate='passenger_count > 4')
     """,
     # Both filters at once: Athena narrows to one payment type, DuckDB applies
     # the rest locally once the rows arrive.
-    "taxi_combined": f"""
+    "combined": f"""
         SELECT payment_type, COUNT(*) AS trips, ROUND(AVG(tip_amount), 2) AS avg_tip
-        FROM athena_scan('data'{_OUT}, database='nyctaxi',
+        FROM athena_scan('trips'{_OUT}, database='{DB}',
                          predicate='payment_type = 1')
         WHERE tip_amount > 5
         GROUP BY payment_type
     """,
-    # A hyphenated Glue database name has to survive quoting on the way to
-    # Athena.
-    "covid_population": f"""
-        SELECT county, state, "population estimate 2018" AS pop_2018
-        FROM athena_scan('county_populations'{_OUT}, database='covid-19')
-        WHERE state = 'New York'
-        ORDER BY TRY_CAST("population estimate 2018" AS BIGINT) DESC
-        LIMIT 10
+    # Glue keeps partition keys out of the column list and Athena returns them
+    # last. A predicate on one prunes instead of scanning: this reads one month
+    # of the six.
+    "partitioned": f"""
+        SELECT yr, mn, COUNT(*) AS trips
+        FROM athena_scan('trips_by_month'{_OUT}, database='{DB}',
+                         predicate='yr = 2024 AND mn = 2')
+        GROUP BY yr, mn
     """,
     # Two scans joined inside DuckDB: each runs its own Athena query, and the
     # join happens locally.
-    "tpcds_join": f"""
-        SELECT a.ca_state, COUNT(*) AS customers
-        FROM athena_scan('customer'{_OUT}, database='tpcds',
-                         predicate='c_birth_year >= 1980') c
-        JOIN athena_scan('customer_address'{_OUT}, database='tpcds') a
-          ON c.c_current_addr_sk = a.ca_address_sk
-        GROUP BY a.ca_state
-        ORDER BY customers DESC
-        LIMIT 10
-    """,
-    "tpcds_customer": f"""
-        SELECT c_first_name, c_last_name, c_birth_year
-        FROM athena_scan('customer'{_OUT}, database='tpcds',
-                         predicate='c_birth_year >= 1980')
-    """,
-    "elb_status": f"""
-        SELECT elbresponsecode, COUNT(*) AS n
-        FROM athena_scan('elb_logs'{_OUT}, database='sampledb')
-        GROUP BY elbresponsecode
-        ORDER BY n DESC
+    "join": f"""
+        SELECT m.mn, COUNT(*) AS trips, ROUND(AVG(t.total_amount), 2) AS avg_fare
+        FROM athena_scan('trips'{_OUT}, database='{DB}',
+                         predicate='passenger_count = 1') t
+        JOIN athena_scan('trips_by_month'{_OUT}, database='{DB}',
+                         predicate='yr = 2024 AND mn = 1') m
+          ON t.pickup_datetime = m.pickup_datetime
+        GROUP BY m.mn
     """,
     # Run this twice: the second run is served from Athena's result cache,
     # scanning 0 bytes and costing nothing. Only safe while the data underneath
     # is not changing.
-    "elb_reuse": f"""
-        SELECT COUNT(url) AS urls
-        FROM athena_scan('elb_logs'{_OUT}, database='sampledb',
-                         result_reuse_minutes=60)
+    "reuse": f"""
+        SELECT COUNT(*) AS trips
+        FROM athena_scan('trips'{_OUT}, database='{DB}', result_reuse_minutes=60)
     """,
     # region= overrides whatever the AWS config chain resolved, so one session
-    # can read tables in more than one region.
-    "elb_region": f"""
-        SELECT COUNT(*) AS n
-        FROM athena_scan('elb_logs'{_OUT}, database='sampledb', region='us-east-1')
-    """,
-    # Glue keeps partition keys out of the column list and Athena returns them
-    # last; a predicate on one prunes instead of scanning. Needs the fixture
-    # named by ATHENA_PARTITIONED_TABLE.
-    "partitioned": f"""
-        SELECT * FROM athena_scan('{PART_TABLE}'{_OUT}, database='{PART_DB}'{_PART_PRED})
+    # can read tables in more than one region. profile= does the same for
+    # credentials. The region here is the one the demo database was created in
+    # -- hard-coding a region would send this example to the wrong regional Glue
+    # catalog for anyone who bootstrapped elsewhere.
+    "region": f"""
+        SELECT COUNT(*) AS trips
+        FROM athena_scan('trips'{_OUT}, database='{DB}', region='{REGION}')
     """,
 }
 
