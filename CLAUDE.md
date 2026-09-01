@@ -73,7 +73,7 @@ export AWS_SECRET_ACCESS_KEY=...
 export AWS_REGION=us-east-1
 ```
 
-Required IAM permissions: `athena:StartQueryExecution`, `athena:GetQueryExecution`, `athena:GetQueryResults`, `glue:GetTable`, `s3:PutObject`/`s3:GetObject` on the results bucket.
+Required IAM permissions: `athena:StartQueryExecution`, `athena:GetQueryExecution`, `athena:GetQueryResults`, `athena:StopQueryExecution`, `glue:GetTable`, `s3:PutObject`/`s3:GetObject` on the results bucket.
 
 ## Architecture
 
