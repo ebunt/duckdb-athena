@@ -95,6 +95,8 @@ export AWS_REGION=us-east-1
 
 Required IAM permissions:
 - `athena:StartQueryExecution`, `athena:GetQueryExecution`, `athena:GetQueryResults`
+- `athena:StopQueryExecution` — used by `timeout_seconds=` and to cancel by hand;
+  without it a timed-out query keeps scanning and billing
 - `glue:GetTable` on the target table
 - `s3:PutObject`, `s3:GetObject` on the S3 results bucket
 
@@ -215,11 +217,16 @@ SELECT * FROM athena_scan('my_table', timeout_seconds=120);
 > printed when it started:
 >
 > ```bash
-> aws athena stop-query-execution --query-execution-id <execution id>
+> aws athena stop-query-execution --query-execution-id <execution id> --region <region>
 > ```
 >
+> `--region` matters: with `region=` the query runs in that region, not the one
+> your CLI defaults to, and a stop sent to the wrong region cancels nothing.
+>
 > `timeout_seconds=` is the exception: on expiry the extension stops the query
-> itself rather than leaving it running.
+> itself rather than leaving it running — provided the caller holds
+> `athena:StopQueryExecution`. If the stop is refused, the error says so instead
+> of leaving a silent charge.
 
 ### Specify a Glue database
 

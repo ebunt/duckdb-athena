@@ -246,6 +246,42 @@ const MAX_RESULT_REUSE_MINUTES: i32 = 7 * 24 * 60;
 /// How long to sleep before the next state check: the backoff, but never past
 /// the deadline. Without the clamp a 5s backoff can overshoot a short timeout by
 /// almost 5s, so `timeout_seconds` would not bound the wait it promises to.
+/// The error text for a query that outlived `timeout_seconds=`.
+///
+/// A failed stop is not a footnote: the timeout promises to stop the query, and
+/// when the stop is refused Athena keeps scanning and billing while DuckDB has
+/// already given up. The commonest cause is an IAM policy built from the
+/// documented permissions before `athena:StopQueryExecution` was among them, so
+/// the message names it rather than leaving a silent charge to be discovered on
+/// the bill.
+///
+/// The recovery command carries `--region` for the same reason `describe_target`
+/// always names the region: with `region=` the query runs where the scan pointed
+/// it, not where the CLI defaults, and a stop sent elsewhere cancels nothing.
+fn timeout_message(
+    id: &str,
+    state: &str,
+    secs: u64,
+    region: Option<&str>,
+    stop_err: Option<&str>,
+) -> String {
+    let base = format!("Athena query {id} still {state} after {secs}s; aborting");
+    let Some(e) = stop_err else {
+        return base;
+    };
+    // No region resolved means no correct command to print: naming a region the
+    // scan did not use would be worse than telling the reader to supply one.
+    let region_flag = match region {
+        Some(r) => format!(" --region {r}"),
+        None => " --region <the region the scan used>".to_string(),
+    };
+    format!(
+        "{base}. Stopping it failed, so it may still be running and billing \
+         -- stop it with `aws athena stop-query-execution --query-execution-id {id}{region_flag}` \
+         (needs athena:StopQueryExecution): {e}"
+    )
+}
+
 fn sleep_before_next_poll(poll_delay: Duration, elapsed: Duration, timeout: Duration) -> Duration {
     poll_delay.min(timeout.saturating_sub(elapsed))
 }
@@ -1062,19 +1098,20 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
                 Queued | Running => {
                     if poll_start.elapsed() >= timeout {
                         // Stop the query so Athena doesn't keep scanning (and
-                        // billing) after we abandon it. Best-effort: we're
-                        // already erroring out, so ignore the stop result.
-                        let _ = crate::RUNTIME.block_on(
+                        // billing) after we abandon it.
+                        let stop = crate::RUNTIME.block_on(
                             client
                                 .stop_query_execution()
                                 .query_execution_id(query_execution_id.clone())
                                 .send(),
                         );
-                        let msg = format!(
-                            "Athena query {} still {:?} after {}s; aborting",
-                            query_execution_id,
-                            state,
-                            timeout.as_secs()
+                        let region = config.region().map(|r| r.to_string());
+                        let msg = timeout_message(
+                            &query_execution_id,
+                            &format!("{state:?}"),
+                            timeout.as_secs(),
+                            region.as_deref(),
+                            stop.err().map(|e| e.to_string()).as_deref(),
                         );
                         let c_msg = CString::new(msg).unwrap_or_default();
                         libduckdb_sys::duckdb_init_set_error(info, c_msg.as_ptr());
@@ -1152,8 +1189,8 @@ mod tests {
         build_athena_query, datum_row_to_result_row, describe_target, mask_string_literals,
         next_poll_delay, parse_optional_arg, parse_reuse_minutes, parse_timeout_seconds,
         projected_select_list, qualified_table, result_output_location, result_row_cell,
-        sleep_before_next_poll, validate_predicate, validate_predicate_columns, POLL_INITIAL,
-        POLL_MAX,
+        sleep_before_next_poll, timeout_message, validate_predicate, validate_predicate_columns,
+        POLL_INITIAL, POLL_MAX,
     };
     use crate::types::ColType;
     use aws_sdk_athena::operation::get_query_execution::GetQueryExecutionOutput;
@@ -1274,6 +1311,44 @@ mod tests {
         assert_eq!(
             describe_target("db", "t", None, &config_with_region(None)),
             "table \"db\".\"t\" in region <no region configured>"
+        );
+    }
+
+    #[test]
+    fn a_refused_stop_is_reported_not_swallowed() {
+        // timeout_seconds= promises to stop the query, not merely to stop
+        // waiting for it. If the stop is refused -- an IAM policy without
+        // athena:StopQueryExecution is the usual reason -- the query keeps
+        // scanning and billing after DuckDB has given up, so the error has to
+        // say so and name the missing permission.
+        let quiet = timeout_message("abc", "Running", 60, Some("eu-west-1"), None);
+        assert_eq!(quiet, "Athena query abc still Running after 60s; aborting");
+        assert!(!quiet.contains("billing"));
+
+        let noisy = timeout_message(
+            "abc",
+            "Running",
+            60,
+            Some("eu-west-1"),
+            Some("AccessDeniedException"),
+        );
+        assert!(
+            noisy.contains("may still be running and billing"),
+            "{noisy}"
+        );
+        assert!(noisy.contains("athena:StopQueryExecution"), "{noisy}");
+        assert!(noisy.contains("AccessDeniedException"), "{noisy}");
+        assert!(noisy.contains("abc"), "{noisy}");
+        // The command has to target the region the scan used, not whatever the
+        // CLI defaults to -- a stop sent to the wrong region cancels nothing.
+        assert!(noisy.contains("--region eu-west-1"), "{noisy}");
+
+        // With no region resolved, ask for one rather than printing a command
+        // that would silently target the wrong place.
+        let vague = timeout_message("abc", "Running", 60, None, Some("boom"));
+        assert!(
+            vague.contains("--region <the region the scan used>"),
+            "{vague}"
         );
     }
 
