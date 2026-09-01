@@ -12,10 +12,17 @@ extension:
   language: Rust
   build: cargo
   license: MIT
-  # WASM cannot run this: it needs the AWS SDK and outbound network access.
-  # musl and the Windows MinGW/rtools toolchains are untested here rather than
-  # known-broken, so they are excluded until someone verifies them.
-  excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads;linux_amd64_musl;windows_amd64_mingw;windows_amd64_rtools"
+  # community-extensions builds every platform in
+  # extension-ci-tools/config/distribution_matrix.json that is not listed here,
+  # and a platform that fails to build fails the submission. Only linux_amd64 and
+  # osx_arm64 are built and load-tested by this repo's own release workflow, so
+  # everything else is excluded as unverified rather than known-broken.
+  #
+  # WASM genuinely cannot work: it needs the AWS SDK and outbound sockets.
+  # The rest are candidates to enable one at a time, each after this repo builds
+  # and loads it first -- linux_arm64 especially, since Graviton is common for
+  # exactly the AWS workloads this extension serves.
+  excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads;linux_arm64;linux_amd64_musl;linux_arm64_musl;osx_amd64;windows_amd64;windows_arm64;windows_amd64_mingw"
   requires_toolchains: "rust"
   maintainers:
     - ebunt
