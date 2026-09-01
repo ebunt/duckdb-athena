@@ -869,6 +869,20 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
                 return;
             }
         };
+        // Picks a named profile from ~/.aws/config for this scan only, so one
+        // session can read across accounts without restarting DuckDB to change
+        // AWS_PROFILE. A profile's own region still loses to `region=`, which is
+        // set on the loader after the profile.
+        let Ok(profile_raw) = named_str("profile") else {
+            return;
+        };
+        let profile = match parse_optional_arg("profile", profile_raw.as_deref()) {
+            Ok(v) => v,
+            Err(e) => {
+                bi.set_error(&e);
+                return;
+            }
+        };
 
         let predicate = {
             let predicate_val = bi.get_named_parameter_value("predicate");
@@ -892,7 +906,7 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
             }
         };
 
-        let config = load_aws_config(region.as_deref());
+        let config = load_aws_config(region.as_deref(), profile.as_deref());
         let client = GlueClient::new(&config);
 
         let table_result = crate::RUNTIME.block_on(
@@ -948,7 +962,7 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
                 // database and the region, since a wrong region looks exactly
                 // like a missing table.
                 let where_ = describe_target(&database, &tablename, region.as_deref(), &config);
-                bi.set_error(&format!("{}: {}", where_, err.into_service_error()));
+                bi.set_error(&format!("{}: {}", where_, error_chain(&err)));
                 return;
             }
         }
@@ -1004,12 +1018,39 @@ fn describe_target(
     format!("table \"{database}\".\"{tablename}\" in region {region}")
 }
 
+/// Every layer of an error, joined.
+///
+/// AWS SDK errors display only their outermost layer. For anything that fails
+/// before the request is dispatched -- a `profile=` that does not exist, absent
+/// credentials -- that layer is the literal string "unhandled error", and the
+/// actual reason sits in `source()`. Walking the chain is the difference between
+/// "unhandled error" and "profile `no_such_profile` was not defined".
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut source = err.source();
+    while let Some(e) = source {
+        let text = e.to_string();
+        // SDK layers repeat themselves; a message printed twice reads like two
+        // separate failures.
+        if !parts.iter().any(|p| p == &text) {
+            parts.push(text);
+        }
+        source = e.source();
+    }
+    parts.join(": ")
+}
+
 /// Resolves AWS config for one scan. Bind loads it and init reuses it through
 /// the bind data, so credentials and region resolve once per scan rather than
 /// twice — but never across scans: a long-lived process that changes
 /// `AWS_PROFILE` between queries must see the new profile, not a cached one.
-fn load_aws_config(region: Option<&str>) -> aws_config::SdkConfig {
+fn load_aws_config(region: Option<&str>, profile: Option<&str>) -> aws_config::SdkConfig {
     let mut loader = aws_config::defaults(BehaviorVersion::latest());
+    // Profile first, region second: `region=` is an explicit instruction and
+    // must win over whatever region the named profile carries.
+    if let Some(profile) = profile {
+        loader = loader.profile_name(profile);
+    }
     if let Some(region) = region {
         loader = loader.region(Region::new(region.to_owned()));
     }
@@ -1298,6 +1339,7 @@ pub fn build_table_function_def() -> TableFunctionBuilder {
         .named_param("database", TypeId::Varchar)
         .named_param("predicate", TypeId::Varchar)
         .named_param("region", TypeId::Varchar)
+        .named_param("profile", TypeId::Varchar)
         .named_param("timeout_seconds", TypeId::Integer)
         .named_param("result_reuse_minutes", TypeId::Integer)
         .projection_pushdown(true)
@@ -1309,7 +1351,7 @@ pub fn build_table_function_def() -> TableFunctionBuilder {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_athena_query, datum_row_to_result_row, describe_target, failure_message,
+        build_athena_query, datum_row_to_result_row, describe_target, error_chain, failure_message,
         mask_string_literals, next_poll_delay, parse_optional_arg, parse_reuse_minutes,
         parse_timeout_seconds, progress_line, projected_select_list, qualified_table,
         result_output_location, result_row_cell, sleep_before_next_poll, timeout_message,
@@ -1435,6 +1477,49 @@ mod tests {
             describe_target("db", "t", None, &config_with_region(None)),
             "table \"db\".\"t\" in region <no region configured>"
         );
+    }
+
+    #[test]
+    fn an_error_reports_every_layer_not_just_the_outermost() {
+        // The failure this fixes: a bad `profile=` renders as the literal
+        // "unhandled error" at the top level, with the real reason -- profile
+        // not defined -- buried in source(). Nothing about that message tells
+        // the reader what to change.
+        #[derive(Debug)]
+        struct Layer(&'static str, Option<Box<Layer>>);
+        impl std::fmt::Display for Layer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1
+                    .as_deref()
+                    .map(|e| e as &(dyn std::error::Error + 'static))
+            }
+        }
+
+        let deep = Layer(
+            "dispatch failure",
+            Some(Box::new(Layer(
+                "the credentials provider was not properly configured",
+                Some(Box::new(Layer("profile `nope` was not defined", None))),
+            ))),
+        );
+        assert_eq!(
+            error_chain(&deep),
+            "dispatch failure: the credentials provider was not properly configured: \
+             profile `nope` was not defined"
+        );
+
+        // A single-layer error is unchanged, not decorated.
+        assert_eq!(error_chain(&Layer("plain", None)), "plain");
+
+        // SDK layers repeat themselves; the same text twice reads as two
+        // separate failures, so it is said once.
+        let repeated = Layer("same", Some(Box::new(Layer("same", None))));
+        assert_eq!(error_chain(&repeated), "same");
     }
 
     #[test]
