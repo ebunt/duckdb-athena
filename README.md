@@ -293,17 +293,31 @@ If a workgroup uses Athena-managed query results and exposes no S3 location, the
 scan falls back to paging `GetQueryResults` 1000 rows at a time, which is roughly
 8 rows/ms — the old behavior, and slow on large results.
 
-The execution id is printed when the query is submitted, and Athena's own
-statistics when it finishes. Nothing is printed while the query is polled, so
-DuckDB's progress bar is left intact — it renders but stays at 0%, because the
-C loadable-extension API exposes no table-function progress callback:
+The execution id is printed when the query is submitted and Athena's own
+statistics when it finishes. In between, any query still running after three
+seconds reports a heartbeat, and repeats it every five seconds:
 
 ```
-Running Athena query, execution id: 152a20c7-ff32-4a19-bb71-ae0135373ca6
-Time in queue: 118 ms
-Run time: 1307 ms
-Data scanned: 4.21 MB
+Running Athena query, execution id: 7ef118ba-c4aa-4d39-af13-82775531716b
+Athena query RUNNING, 4s elapsed, 1.31 GB scanned
+Time in queue: 97 ms
+Run time: 5050 ms
+Data scanned: 1.31 GB
 ```
+
+Bytes appear once Athena starts executing; while it is still planning it
+publishes none, and the line omits them rather than reporting `0 bytes scanned`,
+which would read as a measurement instead of an absence. Once real they are
+worth watching, being the bill as well as the progress.
+
+> **DuckDB's own progress bar stays at 0% for the whole wait.** Nothing in this
+> extension can move it: the C loadable-extension API's entire table-function
+> surface is bind/init/function, parameters, and projection pushdown — there is
+> no progress callback, though C++ table functions have `table_scan_progress`.
+> The heartbeat above scrolls that bar away, which is the trade this makes
+> deliberately: a bar frozen at 0% conveys nothing, and a slow query with no
+> output at all is indistinguishable from a hang. Requested upstream as
+> [duckdb/duckdb#25199](https://github.com/duckdb/duckdb/issues/25199).
 
 `Run time` is Athena's engine time and excludes fetching the result.
 
