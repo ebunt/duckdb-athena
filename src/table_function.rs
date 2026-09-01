@@ -479,7 +479,23 @@ fn validate_predicate(predicate: &str) -> Result<String, String> {
     // Keyword scan only looks at real SQL syntax: string-literal contents are
     // blanked first so a value like `name = 'DROP everything'` isn't mistaken
     // for a DROP statement.
-    let uppercase = mask_string_literals(predicate).to_ascii_uppercase();
+    //
+    // Then every non-word byte becomes a space, so the scan sees tokens rather
+    // than spellings. Matching on " SELECT " alone missed `(SELECT` and
+    // `SELECT\n`, which is enough to smuggle a subquery over another table
+    // past this check -- and a subquery scans and bills a table the caller
+    // never named in athena_scan.
+    let uppercase: String = mask_string_literals(predicate)
+        .to_ascii_uppercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
     for keyword in [
         " SELECT ",
         " INSERT ",
@@ -1734,6 +1750,40 @@ mod tests {
             validate_predicate(" year = 2024 AND event_type = 'click' ").unwrap(),
             "year = 2024 AND event_type = 'click'"
         );
+    }
+
+    #[test]
+    fn a_subquery_cannot_hide_behind_punctuation_or_newlines() {
+        // Removing the identifier check left this scan as the only thing
+        // standing between `predicate=` and a subquery over a table the caller
+        // never named -- which Athena would happily scan and bill. Matching on
+        // the spelling " SELECT " missed every real way of writing it.
+        for smuggled in [
+            "EXISTS (SELECT 1 FROM other_table)",
+            "EXISTS (SELECT\n1 FROM other_table)",
+            "id IN(SELECT id FROM other_table)",
+            "id IN\t(select id from other_table)",
+            "EXISTS\r\n(SELECT\t1)",
+        ] {
+            assert!(
+                validate_predicate(smuggled).is_err(),
+                "should be rejected: {smuggled:?}"
+            );
+        }
+
+        // Tokens, not substrings: a column whose name contains a keyword is
+        // still an ordinary column.
+        for fine in [
+            "selected = 1",
+            "col_select > 0",
+            "insertion_id = 5",
+            "name = 'SELECT 1 FROM t'",
+        ] {
+            assert!(
+                validate_predicate(fine).is_ok(),
+                "should be allowed: {fine:?}"
+            );
+        }
     }
 
     #[test]
