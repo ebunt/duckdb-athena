@@ -82,12 +82,38 @@ Rust `cdylib` crate implementing a DuckDB loadable extension that exposes a sing
 - `src/lib.rs` — entry point; registers `athena_scan` via the `quack-rs` `entry_point!` macro and holds a `LazyLock` Tokio runtime reused for all AWS SDK calls (`RUNTIME.block_on(...)`).
 - `src/table_function.rs` — DuckDB's bind/init/scan lifecycle. Bind discovers the schema via Glue `GetTable`; init submits the Athena query, polls until it completes, and prepares a lazy `GetQueryResults` paginator; scan streams one result page per call (peak memory is one page, not the whole result set). Projection pushdown is implemented (`SELECT` only requested columns); filter pushdown is not — the loadable-extension C API has no table-filter callback, so `WHERE` runs in DuckDB unless pushed manually with `predicate=`. DuckDB never projects zero columns — it keeps one placeholder column even for `COUNT(*)` — so there is no cardinality-only path to special-case.
 - `src/results.rs` — streams the result CSV Athena writes to S3: `parse_s3_uri`, an incremental parser for Athena's CSV dialect (every non-NULL value quoted, NULL as an unquoted empty field, `""` as an empty string, doubled quotes and newlines inside quoted fields), and `CsvRowStream`, which pulls `GetObject` byte chunks and yields at most a vector of rows per scan call.
-- `src/types.rs` — maps Athena/Glue types to DuckDB types, including native `DATE`/`TIMESTAMP` and `DECIMAL(width, scale)`. Complex types (`array<…>`, `map<…>`, `struct<…>`) resolve to `ColType::Json`: registered as `Varchar`, but selected as `CAST(col AS JSON)` so the text is parseable — Athena's default rendering is not (`array['a,b', 'c']` prints as `[a,b, c]`, and map/struct use unescaped `=` and `,`). Only when every nested leaf type is JSON-castable, though: Athena rejects `CAST(array(varbinary) AS JSON)` outright, and a rejected cast fails the whole query, so `binary`, `char`, `time` and unrecognised leaves keep the plain-text fallback. Unmapped types fall back to `Varchar`.
+- `src/types.rs` — maps Athena/Glue types to DuckDB types, including native `DATE`/`TIMESTAMP` and `DECIMAL(width, scale)`. Complex types (`array<…>`, `map<…>`, `struct<…>`) resolve to `ColType::Json`: registered as `Varchar`, but selected as `CAST(col AS JSON)` so the text is parseable — Athena's default rendering is not (`array['a,b', 'c']` prints as `[a,b, c]`, and map/struct use unescaped `=` and `,`). Only when every nested leaf type is JSON-castable, though: Athena rejects `CAST(array(varbinary) AS JSON)` outright, and a rejected cast fails the whole query, so `binary`, `char`, `time` and unrecognised leaves keep the plain-text fallback. Type strings are trimmed and lowercased before matching, because Glue is
+  inconsistent about case and spells sized types `varchar(256)`/`char(10)`: matched
+  raw, a Glue `Int` silently arrived as VARCHAR and broke arithmetic in DuckDB with
+  nothing to explain it. `binary`/`varbinary` map to `Varchar`; genuinely unmapped
+  types still fall back to `Varchar` at the call site.
+- Values that do not parse become NULL rather than a default, boolean included:
+  `populate_column` only accepts `true`/`false` (case-insensitive), so a `"1"` or
+  `"t"` is unknown, not `false`. A wrong boolean joins the false rows in every
+  aggregate unnoticed; a NULL is excluded and visible.
 
-Errors are `Result<_, String>`, surfaced to DuckDB as `Athena(DuckDB): <message>`.
+Errors are `Result<_, String>`, handed to DuckDB via `duckdb_function_set_error`
+(bind) or `duckdb_init_set_error` (init); DuckDB adds its own prefix, so they
+reach the user as `Binder Error: <message>` from bind and `Invalid Input Error:
+<message>` from init. Verified, not assumed:
+
+```
+Binder Error: table "sampledb"."no_such_table" in region us-east-1: EntityNotFoundException: Entity Not Found
+Binder Error: database must not be empty; omit it to use the default
+Invalid Input Error: Athena query 891ed2c0-... Failed: INVALID_LITERAL: line 1:71: 'not-a-date' is not a valid TIMESTAMP literal
+```
+
+A failed or cancelled query carries Athena's own `StateChangeReason` — the
+syntax error, the denied permission — and says `(Athena gave no reason)` when
+Athena supplies none, rather than trailing an empty colon.
 
 **Key constraints**:
 - Results are streamed from the single CSV Athena writes at `GetQueryExecution`'s `ResultConfiguration.OutputLocation` (one `GetObject`, needs `s3:GetObject` on the results bucket): 1.07M rows ≈ 3s. `GetQueryResults` paging (1000 rows per call, ~8 rows/ms, ≈135s for the same table) remains only as the fallback for executions exposing no S3 location, e.g. Athena-managed query results. Athena's printed `Run time` is engine time and excludes fetching
+- A query still running after 3s prints a heartbeat (`Athena query RUNNING, 4s
+  elapsed, 1.31 GB scanned`), repeated every 5s; the poll sleep is clamped to that
+  deadline as well as the timeout, or the backoff would stretch a 5s cadence to 9s.
+  DuckDB's own progress bar cannot move — the C API exposes no table-function
+  progress callback (duckdb/duckdb#25199), so it renders at 0% for the whole wait
 - `maxrows` is unlimited by default (no `LIMIT` clause); pass `maxrows=N` (> 0) to add `LIMIT N` to the Athena SQL. Unset or any value <= 0 (e.g. `maxrows=-1`) means all rows, so aggregates/joins see the full table
 - `database` defaults to `"default"` (the Glue database name)
 - Filter pushdown is not implemented — all filtering happens in DuckDB after the full scan; use `predicate=` to push a raw Athena `WHERE` predicate instead

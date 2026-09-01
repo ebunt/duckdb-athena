@@ -18,6 +18,11 @@ gh release download --repo ebunt/duckdb-athena \
 tar -xzf athena-osx_arm64.tar.gz
 ```
 
+The Linux binary is built in the manylinux image DuckDB's own community
+extensions use, so it needs no glibc newer than **2.28** — it loads on Amazon
+Linux 2023, RHEL 8+, Ubuntu 20.04+, Debian 11+ and AWS CloudShell. CI fails the
+build if that baseline ever rises.
+
 The archive contains a single file, `athena.duckdb_extension`. **Do not
 rename it.** DuckDB derives the extension's init symbol from the file name, so a
 renamed file fails to load with:
@@ -319,6 +324,23 @@ worth watching, being the bill as well as the progress.
 > output at all is indistinguishable from a hang. Requested upstream as
 > [duckdb/duckdb#25199](https://github.com/duckdb/duckdb/issues/25199).
 
+### When a query fails
+
+Errors carry Athena's own explanation rather than only the execution id, so the
+cause is in the terminal instead of the Athena console:
+
+```
+Invalid Input Error: Athena query 891ed2c0-82bf-47a0-afa8-044cde50c2e7 Failed:
+INVALID_LITERAL: line 1:71: 'not-a-date' is not a valid TIMESTAMP literal
+```
+
+Lookup failures name the database, table and region, because a table in another
+region reports the same "Entity Not Found" as one that does not exist:
+
+```
+Binder Error: table "sampledb"."no_such_table" in region us-east-1: EntityNotFoundException: Entity Not Found
+```
+
 `Run time` is Athena's engine time and excludes fetching the result.
 
 ## Projection pushdown
@@ -350,6 +372,13 @@ SELECT COUNT(*) FROM athena_scan('my_table');
 - Returns all rows by default; pass `maxrows=N` to cap (an outer DuckDB `LIMIT` is not pushed to Athena)
 - Results are streamed from the query's result CSV on S3 (one `GetObject`), which needs `s3:GetObject` on the results bucket. Workgroups using Athena-managed query results expose no S3 location, so those fall back to `GetQueryResults` paging at 1000 rows per call (~8 rows/ms)
 - Workgroup defaults to `primary`; override with `workgroup=`
+- A value Athena returns that does not parse as its declared type becomes NULL,
+  never a default. Booleans accept only `true`/`false` (case-insensitive): a `"1"`
+  or `"t"` is NULL rather than `false`, since a wrong boolean would join the false
+  rows in every aggregate unnoticed while a NULL is excluded and visible
+- Glue type strings are matched case-insensitively and with sizes stripped, so
+  `Int`, `BIGINT ` and `varchar(256)` map to the types their lowercase spellings
+  would. Types with no DuckDB counterpart still come back as `VARCHAR`
 
 ## License
 
