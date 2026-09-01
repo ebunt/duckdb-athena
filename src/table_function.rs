@@ -307,6 +307,59 @@ fn sleep_before_next_poll(poll_delay: Duration, elapsed: Duration, timeout: Dura
 }
 
 /// Next poll delay: exponential backoff doubling up to `cap`.
+/// How long a query may run before the poll loop says anything, and how often
+/// it repeats itself afterwards.
+///
+/// Three seconds rather than five because of where the backoff actually lands:
+/// polls happen at 0.25, 0.75, 1.75, 3.75, 8.75s, so a five-second threshold is
+/// not observed until 8.75s -- a six-second query, long enough to look hung,
+/// would report nothing at all.
+const PROGRESS_AFTER: Duration = Duration::from_secs(3);
+const PROGRESS_EVERY: Duration = Duration::from_secs(5);
+
+/// A heartbeat for the poll loop, or `None` while it should stay quiet.
+///
+/// DuckDB's progress bar cannot move for a table function loaded through the C
+/// API: the whole surface is bind/init/function plus projection pushdown, with
+/// no progress callback (C++ table functions have `table_scan_progress`; this
+/// one does not). So the bar renders at 0% for the entire wait, and a long
+/// query is indistinguishable from a hang. Printing our own line is the only
+/// feedback available -- it scrolls the bar, which costs nothing, because a bar
+/// pinned at 0% was telling the reader nothing.
+///
+/// Athena publishes no byte count while it plans -- as an absent field over the
+/// API, but as a literal `0` through the SDK on an in-flight execution -- and
+/// fills it in once execution starts (measured on 52a65dc8: `RUNNING` with
+/// nothing at 0.7s, `RUNNING` with 1,243,974,270 bytes at 1.4s). Both forms mean
+/// "not yet", so both are omitted: a heartbeat reading `0 bytes scanned` while
+/// Athena chews through a gigabyte is worse than one that says nothing about
+/// bytes at all. Once real, the figure doubles as a spend meter.
+/// `since_last` is `None` until something has actually been reported: the first
+/// heartbeat is gated on `PROGRESS_AFTER` alone, and only repeats wait for
+/// `PROGRESS_EVERY`. Folding the two together would push the first line to the
+/// 8.75s poll and undo the point of the lower threshold.
+fn progress_line(
+    elapsed: Duration,
+    since_last: Option<Duration>,
+    state: &str,
+    bytes: Option<i64>,
+) -> Option<String> {
+    if elapsed < PROGRESS_AFTER {
+        return None;
+    }
+    if since_last.is_some_and(|d| d < PROGRESS_EVERY) {
+        return None;
+    }
+    let scanned = match bytes {
+        Some(b) if b > 0 => format!(", {} scanned", format_bytes(b)),
+        _ => String::new(),
+    };
+    Some(format!(
+        "Athena query {state}, {}s elapsed{scanned}",
+        elapsed.as_secs()
+    ))
+}
+
 fn next_poll_delay(current: Duration, cap: Duration) -> Duration {
     (current * 2).min(cap)
 }
@@ -316,6 +369,12 @@ fn status(resp: &GetQueryExecutionOutput) -> Option<QueryExecutionState> {
         .and_then(|qe| qe.status())
         .and_then(|s| s.state())
         .cloned()
+}
+
+fn scanned_bytes(resp: &GetQueryExecutionOutput) -> Option<i64> {
+    resp.query_execution()
+        .and_then(|qe| qe.statistics())
+        .and_then(|s| s.data_scanned_in_bytes())
 }
 
 fn print_query_stats(resp: &GetQueryExecutionOutput) {
@@ -1101,6 +1160,7 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
         eprintln!("Running Athena query, execution id: {query_execution_id}");
 
         let poll_start = Instant::now();
+        let mut last_report: Option<Instant> = None;
         let mut poll_delay = POLL_INITIAL;
         loop {
             let get_resp = crate::RUNTIME.block_on(
@@ -1151,8 +1211,18 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
                         libduckdb_sys::duckdb_init_set_error(info, c_msg.as_ptr());
                         return;
                     }
-                    // Deliberately quiet: DuckDB renders its own progress bar
-                    // while the scan runs, and a line per poll scrolls it away.
+                    // The one piece of feedback available: DuckDB's own
+                    // progress bar is stuck at 0% for the whole wait (see
+                    // progress_line), so without this a slow query looks hung.
+                    if let Some(line) = progress_line(
+                        poll_start.elapsed(),
+                        last_report.map(|t: Instant| t.elapsed()),
+                        &format!("{state:?}").to_uppercase(),
+                        scanned_bytes(&resp),
+                    ) {
+                        eprintln!("{line}");
+                        last_report = Some(Instant::now());
+                    }
                     thread::sleep(sleep_before_next_poll(
                         poll_delay,
                         poll_start.elapsed(),
@@ -1223,7 +1293,8 @@ mod tests {
     use super::{
         build_athena_query, datum_row_to_result_row, describe_target, failure_message,
         mask_string_literals, next_poll_delay, parse_optional_arg, parse_reuse_minutes,
-        parse_timeout_seconds, projected_select_list, qualified_table, result_output_location,
+        parse_timeout_seconds, progress_line, projected_select_list, qualified_table,
+        result_output_location,
         result_row_cell, sleep_before_next_poll, timeout_message, validate_predicate,
         validate_predicate_columns, POLL_INITIAL, POLL_MAX,
     };
@@ -1407,6 +1478,81 @@ mod tests {
         assert!(
             vague.contains("--region <the region the scan used>"),
             "{vague}"
+        );
+    }
+
+    #[test]
+    fn a_short_query_says_nothing_extra() {
+        // The heartbeat exists for waits long enough to look like a hang. A
+        // two-second scan is not one, and a line per poll would be noise.
+        assert_eq!(
+            progress_line(Duration::from_secs(2), None, "RUNNING", None),
+            None
+        );
+        // ... but the first poll past the threshold speaks, and with the real
+        // backoff (0.25/0.75/1.75/3.75s) that is the poll at 3.75s. A
+        // five-second threshold would not be observed until 8.75s, so a
+        // six-second query -- exactly the kind that looks hung -- stayed silent.
+        assert!(progress_line(Duration::from_millis(3750), None, "RUNNING", None).is_some());
+    }
+
+    #[test]
+    fn a_long_query_reports_elapsed_and_spend() {
+        // DuckDB's bar is pinned at 0% for the whole wait -- the C API has no
+        // progress callback -- so this line is the only sign of life. Bytes go
+        // in it because they are also the bill.
+        let line = progress_line(
+            Duration::from_secs(30),
+            Some(Duration::from_secs(5)),
+            "RUNNING",
+            Some(1_243_974_270),
+        )
+        .expect("should speak after the threshold");
+        assert!(line.contains("RUNNING"), "{line}");
+        assert!(line.contains("30s elapsed"), "{line}");
+        assert!(line.contains("1.16 GB scanned"), "{line}");
+    }
+
+    #[test]
+    fn bytes_are_omitted_until_athena_publishes_them() {
+        // Athena publishes no byte count while it plans, so the line has to
+        // read correctly with nothing to report.
+        let line = progress_line(
+            Duration::from_secs(10),
+            Some(Duration::from_secs(5)),
+            "QUEUED",
+            None,
+        )
+        .expect("should speak after the threshold");
+        assert_eq!(line, "Athena query QUEUED, 10s elapsed");
+        assert!(!line.contains("scanned"), "{line}");
+
+        // A mid-flight zero means the same thing, and this is the form actually
+        // observed: the SDK reported Some(0), not None, while the query was
+        // still RUNNING. "0 bytes scanned" reads as a fact rather than an
+        // absence, so it is suppressed too.
+        let zero = progress_line(
+            Duration::from_secs(10),
+            Some(Duration::from_secs(5)),
+            "RUNNING",
+            Some(0),
+        )
+        .expect("should speak after the threshold");
+        assert_eq!(zero, "Athena query RUNNING, 10s elapsed");
+    }
+
+    #[test]
+    fn the_heartbeat_does_not_repeat_itself_every_poll() {
+        // The backoff polls faster than the report interval near the start, so
+        // without the since-last check one wait would print many lines.
+        assert_eq!(
+            progress_line(
+                Duration::from_secs(30),
+                Some(Duration::from_millis(800)),
+                "RUNNING",
+                Some(1)
+            ),
+            None
         );
     }
 
