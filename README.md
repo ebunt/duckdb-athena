@@ -189,6 +189,26 @@ Region is worth setting explicitly when a lookup fails: a table that exists in
 another region reports the same "Entity Not Found" as one that does not exist,
 so the error message always names the region it searched.
 
+### Profile
+
+`profile=` picks a named profile from `~/.aws/config` for that scan, so one
+session can read across accounts without restarting DuckDB to change
+`AWS_PROFILE`:
+
+```sql
+SELECT * FROM athena_scan('my_table', profile='prod', region='eu-west-1');
+```
+
+The profile is applied before `region=`, so an explicit region wins over
+whatever region the profile carries. A profile that does not exist fails at
+bind, naming itself:
+
+```
+Binder Error: table "sampledb"."elb_logs" in region us-east-1: dispatch failure:
+other: the credentials provider was not properly configured: ProfileFile
+provider could not be built: profile `nope` was not defined
+```
+
 ### Reuse a recent result
 
 Athena can return a previous identical query's result instead of re-running it,

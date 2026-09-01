@@ -118,6 +118,11 @@ Athena supplies none, rather than trailing an empty colon.
 - `database` defaults to `"default"` (the Glue database name)
 - Filter pushdown is not implemented — all filtering happens in DuckDB after the full scan; use `predicate=` to push a raw Athena `WHERE` predicate instead
 - The Athena query workgroup defaults to `primary`; override with the `workgroup=` named parameter
+- `profile=` selects a named profile from `~/.aws/config`, applied to the loader
+  before `region=` so an explicit region beats the profile's own. AWS SDK errors
+  display only their outermost layer — for a bad profile that layer is the literal
+  string `unhandled error` — so `error_chain` walks `source()` and joins every
+  layer, which is what turns that into ``profile `nope` was not defined``
 - `region=` overrides the region the AWS config chain resolves; `SdkConfig` is loaded once per region and cached in `aws_config_for`, since bind and init both need a client
 - `timeout_seconds=` bounds the poll loop (default 1 hour, `DEFAULT_POLL_WAIT`); on expiry the query is stopped, not abandoned
 - `result_reuse_minutes=` enables Athena's `ResultReuseConfiguration` (max 7 days). A reused result scans 0 bytes: measured 846 KB/540 ms → 0 bytes/154 ms on a repeat

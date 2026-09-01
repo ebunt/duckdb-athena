@@ -60,7 +60,8 @@ docs:
       functions work on them.
 
     Named parameters: `database`, `maxrows`, `predicate`, `workgroup`,
-    `output_location`, `region`, `timeout_seconds`, `result_reuse_minutes`.
+    `output_location`, `region`, `profile`, `timeout_seconds`,
+    `result_reuse_minutes`.
 
     Required IAM: `athena:StartQueryExecution`, `athena:GetQueryExecution`,
     `athena:GetQueryResults`, `athena:StopQueryExecution`, `glue:GetTable`, and
