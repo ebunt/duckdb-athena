@@ -90,7 +90,7 @@ DuckDB's internals, which is the tradeoff the C API exists to avoid.
 The extension now prints its own heartbeat to stderr during the poll:
 
 ```
-Running Athena query, execution id: 7ef118ba-c4aa-4d39-af13-82775531716b
+Running Athena query, execution id: 00000000-0000-0000-0000-000000000000
 Athena query RUNNING, 4s elapsed, 1.31 GB scanned
 ```
 
