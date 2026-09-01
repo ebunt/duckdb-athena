@@ -219,16 +219,21 @@ second=$(reuse_run)
 check "second identical query is reused" "True	0" "$second"
 
 echo
-echo "-- predicate validation rejects unknown columns at bind"
-if duckdb -unsigned -c "LOAD '$EXTENSION';
-    SELECT 1 FROM athena_scan('elb_logs', database='sampledb', predicate='nosuchcol = 1');" \
-    > /dev/null 2>&1; then
-    printf 'FAIL %-42s bind accepted an unknown column\n' "unknown predicate column rejected"
-    fail=$((fail + 1))
-else
-    printf 'ok   %-42s rejected at bind\n' "unknown predicate column rejected"
-    pass=$((pass + 1))
-fi
+echo "-- an unknown predicate column fails, with Athena's own reason"
+# The extension no longer pre-parses the predicate to check column names: Athena
+# rejects an unknown column itself in ~0.5s for 0 bytes scanned, and its message
+# names the column. What matters is that the reason reaches the user rather than
+# an opaque "Query Failed", so this asserts on the text, not just the failure.
+err=$(duckdb -unsigned -c "LOAD '$EXTENSION';
+    SELECT 1 FROM athena_scan('elb_logs', database='sampledb', predicate='nosuchcol = 1');" 2>&1 || true)
+case "$err" in
+    *COLUMN_NOT_FOUND*nosuchcol*)
+        printf 'ok   %-42s %s\n' "unknown predicate column" "Athena reason surfaced"
+        pass=$((pass + 1)) ;;
+    *)
+        printf 'FAIL %-42s %s\n' "unknown predicate column" "$(printf '%s' "$err" | tail -1)"
+        fail=$((fail + 1)) ;;
+esac
 
 echo
 echo "$pass passed, $fail failed"
