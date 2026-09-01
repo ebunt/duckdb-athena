@@ -302,8 +302,15 @@ fn timeout_message(
     )
 }
 
-fn sleep_before_next_poll(poll_delay: Duration, elapsed: Duration, timeout: Duration) -> Duration {
-    poll_delay.min(timeout.saturating_sub(elapsed))
+fn sleep_before_next_poll(
+    poll_delay: Duration,
+    elapsed: Duration,
+    timeout: Duration,
+    until_report: Duration,
+) -> Duration {
+    poll_delay
+        .min(timeout.saturating_sub(elapsed))
+        .min(until_report)
 }
 
 /// Next poll delay: exponential backoff doubling up to `cap`.
@@ -311,8 +318,8 @@ fn sleep_before_next_poll(poll_delay: Duration, elapsed: Duration, timeout: Dura
 /// it repeats itself afterwards.
 ///
 /// Three seconds rather than five because of where the backoff actually lands:
-/// polls happen at 0.25, 0.75, 1.75, 3.75, 8.75s, so a five-second threshold is
-/// not observed until 8.75s -- a six-second query, long enough to look hung,
+/// polls happen at 0.25, 0.75, 1.75, 3.75, 7.75s, so a five-second threshold is
+/// not observed until 7.75s -- a six-second query, long enough to look hung,
 /// would report nothing at all.
 const PROGRESS_AFTER: Duration = Duration::from_secs(3);
 const PROGRESS_EVERY: Duration = Duration::from_secs(5);
@@ -337,7 +344,7 @@ const PROGRESS_EVERY: Duration = Duration::from_secs(5);
 /// `since_last` is `None` until something has actually been reported: the first
 /// heartbeat is gated on `PROGRESS_AFTER` alone, and only repeats wait for
 /// `PROGRESS_EVERY`. Folding the two together would push the first line to the
-/// 8.75s poll and undo the point of the lower threshold.
+/// 7.75s poll and undo the point of the lower threshold.
 fn progress_line(
     elapsed: Duration,
     since_last: Option<Duration>,
@@ -1223,10 +1230,21 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
                         eprintln!("{line}");
                         last_report = Some(Instant::now());
                     }
+                    // Wake for whichever comes first: the next poll, the
+                    // deadline, or the next heartbeat. Without the last one the
+                    // backoff decides the cadence -- the poll after the first
+                    // report lands 4s later, is too early to report, and the
+                    // one after that is 9s later, so a "every five seconds"
+                    // heartbeat goes quiet for nine.
+                    let until_report = match last_report {
+                        Some(t) => PROGRESS_EVERY.saturating_sub(t.elapsed()),
+                        None => PROGRESS_AFTER.saturating_sub(poll_start.elapsed()),
+                    };
                     thread::sleep(sleep_before_next_poll(
                         poll_delay,
                         poll_start.elapsed(),
                         timeout,
+                        until_report,
                     ));
                     poll_delay = next_poll_delay(poll_delay, POLL_MAX);
                 }
@@ -1294,9 +1312,8 @@ mod tests {
         build_athena_query, datum_row_to_result_row, describe_target, failure_message,
         mask_string_literals, next_poll_delay, parse_optional_arg, parse_reuse_minutes,
         parse_timeout_seconds, progress_line, projected_select_list, qualified_table,
-        result_output_location,
-        result_row_cell, sleep_before_next_poll, timeout_message, validate_predicate,
-        validate_predicate_columns, POLL_INITIAL, POLL_MAX,
+        result_output_location, result_row_cell, sleep_before_next_poll, timeout_message,
+        validate_predicate, validate_predicate_columns, POLL_INITIAL, POLL_MAX,
     };
     use crate::types::ColType;
     use aws_sdk_athena::operation::get_query_execution::GetQueryExecutionOutput;
@@ -1491,7 +1508,7 @@ mod tests {
         );
         // ... but the first poll past the threshold speaks, and with the real
         // backoff (0.25/0.75/1.75/3.75s) that is the poll at 3.75s. A
-        // five-second threshold would not be observed until 8.75s, so a
+        // five-second threshold would not be observed until 7.75s, so a
         // six-second query -- exactly the kind that looks hung -- stayed silent.
         assert!(progress_line(Duration::from_millis(3750), None, "RUNNING", None).is_some());
     }
@@ -1562,23 +1579,62 @@ mod tests {
         // timeout by nearly that much -- which would make timeout_seconds= fail
         // to bound the wait it promises to bound.
         let timeout = Duration::from_secs(1);
+        let far = Duration::from_secs(3600);
         assert_eq!(
-            sleep_before_next_poll(Duration::from_secs(5), Duration::from_millis(750), timeout),
+            sleep_before_next_poll(
+                Duration::from_secs(5),
+                Duration::from_millis(750),
+                timeout,
+                far
+            ),
             Duration::from_millis(250)
         );
         // Deadline already passed: do not sleep at all.
         assert_eq!(
-            sleep_before_next_poll(Duration::from_secs(5), Duration::from_secs(2), timeout),
+            sleep_before_next_poll(Duration::from_secs(5), Duration::from_secs(2), timeout, far),
             Duration::ZERO
         );
-        // Far from the deadline the backoff is used unchanged.
+        // Far from every deadline the backoff is used unchanged.
         assert_eq!(
             sleep_before_next_poll(
                 Duration::from_millis(250),
                 Duration::ZERO,
-                Duration::from_secs(60)
+                Duration::from_secs(60),
+                far
             ),
             Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn polling_wakes_up_in_time_for_the_next_heartbeat() {
+        // The backoff, left alone, sets the reporting cadence: after the first
+        // heartbeat at 3.75s the next poll is at 7.75s -- only 4s later, so it
+        // reports nothing -- and the one after that is at 12.75s. A heartbeat
+        // documented as "every five seconds" would go quiet for nine.
+        //
+        // So the sleep is also clamped to whatever is left of the heartbeat
+        // interval: at 3.75s with 4s of backoff and 5s until the next report
+        // due, wake at the report, not after it.
+        assert_eq!(
+            sleep_before_next_poll(
+                Duration::from_secs(4),
+                Duration::from_millis(3750),
+                Duration::from_secs(3600),
+                Duration::from_secs(5),
+            ),
+            Duration::from_secs(4),
+            "backoff shorter than the report interval is left alone"
+        );
+        assert_eq!(
+            sleep_before_next_poll(
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_secs(3600),
+                Duration::from_secs(2),
+            ),
+            Duration::from_secs(2),
+            "a report due before the next poll pulls the wake-up in"
         );
     }
 
