@@ -22,9 +22,11 @@ extension:
 
 repo:
   github: ebunt/duckdb-athena
-  # main at the LICENSE restore -- the first commit whose tree carries the MIT
-  # file the `license:` above claims. Their CI builds this sha, not a tag.
-  ref: 60141481e9eb6afd95b45deec4a5ab819b4314d1
+  # Their CI builds this sha, not a tag, so it has to be a commit whose tree
+  # carries both the MIT file `license:` claims and the current behaviour --
+  # here, the one where a refused stop_query_execution is reported rather than
+  # swallowed. Repin when anything user-visible lands on main.
+  ref: 0e6b29e83a83605fdf8a733a5c8ad0dc294f033f
 
 docs:
   hello_world: |
