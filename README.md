@@ -199,9 +199,11 @@ session can read across accounts without restarting DuckDB to change
 SELECT * FROM athena_scan('my_table', profile='prod', region='eu-west-1');
 ```
 
-The profile is applied before `region=`, so an explicit region wins over
-whatever region the profile carries. A profile that does not exist fails at
-bind, naming itself:
+The named profile supplies the credentials, overriding `AWS_ACCESS_KEY_ID` and
+friends for that scan — otherwise the default chain would read the environment
+first and `profile=` would silently change nothing. Region resolves in the order
+`region=`, then the profile's own region, then `AWS_REGION` and the rest of the
+chain. A profile that does not exist fails at bind, naming itself:
 
 ```
 Binder Error: table "sampledb"."elb_logs" in region us-east-1: dispatch failure:

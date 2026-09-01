@@ -1,3 +1,5 @@
+use aws_config::meta::region::RegionProviderChain;
+use aws_config::profile::{ProfileFileCredentialsProvider, ProfileFileRegionProvider};
 use aws_config::BehaviorVersion;
 use aws_config::Region;
 use aws_sdk_athena::{
@@ -1046,10 +1048,36 @@ fn error_chain(err: &dyn std::error::Error) -> String {
 /// `AWS_PROFILE` between queries must see the new profile, not a cached one.
 fn load_aws_config(region: Option<&str>, profile: Option<&str>) -> aws_config::SdkConfig {
     let mut loader = aws_config::defaults(BehaviorVersion::latest());
-    // Profile first, region second: `region=` is an explicit instruction and
-    // must win over whatever region the named profile carries.
     if let Some(profile) = profile {
-        loader = loader.profile_name(profile);
+        // An explicit credentials provider, not `loader.profile_name()`. That
+        // only tells the *profile-file provider* which profile to read, and the
+        // default chain consults environment credentials first -- so with
+        // AWS_ACCESS_KEY_ID set (which the README suggests) `profile=prod` was
+        // silently ignored and the query ran against the environment's account.
+        // Measured before the fix: a profile that does not exist still returned
+        // "The security token included in the request is invalid" from the env
+        // credentials, rather than saying the profile was not defined.
+        loader = loader.credentials_provider(
+            ProfileFileCredentialsProvider::builder()
+                .profile_name(profile)
+                .build(),
+        );
+        // Same reasoning for the region: the profile's own region should apply
+        // when the scan did not name one, and lose when it did. A chain, not a
+        // bare provider -- setting the profile provider alone *replaces* the
+        // region chain, so AWS_REGION stopped being a fallback and a profile
+        // without a region reported "<no region configured>" despite the
+        // environment having one.
+        if region.is_none() {
+            loader = loader.region(
+                RegionProviderChain::first_try(
+                    ProfileFileRegionProvider::builder()
+                        .profile_name(profile)
+                        .build(),
+                )
+                .or_default_provider(),
+            );
+        }
     }
     if let Some(region) = region {
         loader = loader.region(Region::new(region.to_owned()));
