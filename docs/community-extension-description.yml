@@ -22,7 +22,9 @@ extension:
 
 repo:
   github: ebunt/duckdb-athena
-  ref: PIN_TO_THE_SUBMITTED_COMMIT
+  # main at the LICENSE restore -- the first commit whose tree carries the MIT
+  # file the `license:` above claims. Their CI builds this sha, not a tag.
+  ref: d0c1280797717f980a1a105b1006a956f29ad10e
 
 docs:
   hello_world: |
