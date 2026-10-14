@@ -26,16 +26,31 @@ statement keywords, and every column it names must exist in the Glue schema.
 
 - **Optimizer-driven filter pushdown.** `libduckdb-sys` exposes projection
   pushdown but no table-filter callback / `duckdb_table_filter` accessors, so a
-  plain `WHERE` cannot be pushed into Athena automatically. Still true as of
-  DuckDB v1.5.5: `duckdb_extension.h` contains no occurrence of `filter`.
+  plain `WHERE` cannot be pushed into Athena automatically. Still true for the
+  stable C API (v1, `duckdb_extension.h`) as of DuckDB v1.5.5/v1.5.6.
 
-  Real predicate pushdown needs the DuckDB C++ extension API, which means
-  rebuilding and re-releasing per DuckDB version instead of one C-API build that
-  loads across 1.x — roughly 1-2 weeks to port, plus 2-3 days for the predicate
-  translation below, plus that ongoing tax. Asked upstream instead:
-  duckdb/duckdb#25163, filed 2026-08-30, with the argument kept in
-  `docs/upstream-issue-filter-pushdown.md`. Manual `predicate=` is the supported
-  path meanwhile, and on partitioned tables it already prunes.
+  Upstream: duckdb/duckdb#25163, filed 2026-08-30, argument kept in
+  `docs/upstream-issue-filter-pushdown.md`. Closed 2026-10-13 as "fixed on
+  nightly" — checked against the actual commit (`src/main/capi/v2/capi_v2_func_table.cpp`,
+  Oct 7-11 2026, branch `v2.0-cyanoptera`) and it isn't usable yet:
+
+  - It shipped in a brand-new, unreleased **C API v2**, not as an addition to
+    the stable v1 API this extension builds against. No tagged DuckDB release
+    contains it.
+  - The shape differs from what was requested: no column/comparator/constant
+    accessors. The callback (`duckdb_v2_table_function_set_filter_pushdown_callback`)
+    hands over `duckdb_v2_expression_handle` nodes
+    (`..._filter_pushdown_get_filter`) to walk via the v2 expression API, and
+    an index-based `..._accept` to mark each one handled.
+  - `quack-rs` (the Rust wrapper this extension depends on) has no path to it:
+    0.18.0, its latest release as of 2026-10-02, states in its own changelog
+    that it "still targets [C API] v1.2.0."
+
+  Revisit when either lands: `quack-rs` ships v2 support, or DuckDB 2.0 cuts a
+  release with a stable v2 API. Until then this stays blocked — not on a
+  missing feature anymore, but on an unstable, unreleased, unwrapped one.
+  Manual `predicate=` is the supported path meanwhile, and on partitioned
+  tables it already prunes.
 
 ## Deferred
 
@@ -85,9 +100,10 @@ statement keywords, and every column it names must exist in the Glue schema.
   (a cut on a row boundary parses cleanly and would otherwise be reported as a
   complete, shorter result).
 
-## Predicate translation design (for the C++ API path)
+## Predicate translation design (for whichever filter-pushdown API arrives)
 
-If/when the extension moves to the C++ extension API for native filter pushdown:
+If/when native filter pushdown becomes available (C++ extension API, or a
+wrapped DuckDB C API v2):
 
 - Supported subset first: `=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT] NULL`,
   `AND`, small `IN (...)` lists. Defer `OR`, `LIKE`, functions, casts,
