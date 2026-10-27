@@ -18,6 +18,11 @@ make clean       # cargo clean + build/
 `make release` leaves the loadable extension at
 `build/release/extension/athena/athena.duckdb_extension`.
 
+`[profile.release]` in `Cargo.toml` must keep `panic = "unwind"`: quack-rs
+(since 0.16.0) validates the release profile at build time and refuses
+`panic = "abort"`, since an aborting panic inside the extension would take
+the whole DuckDB host process down with it.
+
 DuckDB 1.0+ only loads files ending in `.duckdb_extension`, and requires a
 metadata footer (platform, extension version, ABI). `base.Makefile` appends it
 via `append_extension_metadata.py`; nothing in this repo does that by hand.
@@ -33,9 +38,11 @@ what it is; `release.yml` passes `EXTENSION_VERSION` with the tag name. Keep the
 crate version in step with the tag when releasing.
 
 Deliberately *not* set: `USE_UNSTABLE_C_API`. quack-rs targets the stable
-`C_STRUCT` ABI, so one build loads across DuckDB 1.x. The official Rust template
-sets that flag only because duckdb-rs needs unstable C API functions, which pins
-those extensions to a single DuckDB version.
+`C_STRUCT` ABI, so one build loads across DuckDB 1.x and 2.0 (verified: a
+build stamped `duckdb_version=v1.2.0` loads into DuckDB v2.0.0 "Cyanoptera").
+The official Rust template sets that flag only because duckdb-rs needs
+unstable C API functions, which pins those extensions to a single DuckDB
+version.
 
 ## Lint & format
 

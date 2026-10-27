@@ -30,13 +30,21 @@ shows it isn't a fix the extension can use:
   v2 expression API, with `duckdb_v2_table_function_filter_pushdown_accept(index)`
   to mark each one as handled.
 - `quack-rs`, the Rust wrapper this extension depends on, has no path to any
-  of this: version 0.18.0 (its latest, released 2026-10-02) states in its own
-  changelog that it "still targets [C API] v1.2.0."
+  of this: version 0.19.0 (its latest, released 2026-10-23) states in its own
+  changelog that DuckDB 2.0 loads a v2 pushdown binary "only through a C API
+  v2 entry point (`<name>_init_c_api_v2`), which quack-rs does not generate."
 
 Net effect: still blocked, just not for the original reason (API gap). Now
-it's an unreleased, unstable, unwrapped API. Revisit when `quack-rs` adds v2
-support, or DuckDB 2.0 ships a stable v2 API — whichever comes first. Tracked
-in `TODO.md`.
+it's an unstable, unwrapped API. Revisit when `quack-rs` adds v2 support, or
+DuckDB marks v2 stable — whichever comes first. Tracked in `TODO.md`.
+
+**Update, 2026-10-27 (DuckDB 2.0.0 "Cyanoptera" released 2026-10-21):** no
+change. DuckDB's own 2.0 announcement says C API v2 is deliberately not
+marked stable yet — the team wants field testing first, via a linked GitHub
+discussion. `quack-rs` 0.19.0 (released two days after 2.0.0, with CI tested
+against it) adds DuckDB 2.0 *runtime* support for extensions built on the
+existing stable v1 API, but still does not wrap v2 or its filter-pushdown
+callback. So the blocker is unchanged: still an unstable, unwrapped API.
 
 ---
 

@@ -27,28 +27,31 @@ statement keywords, and every column it names must exist in the Glue schema.
 - **Optimizer-driven filter pushdown.** `libduckdb-sys` exposes projection
   pushdown but no table-filter callback / `duckdb_table_filter` accessors, so a
   plain `WHERE` cannot be pushed into Athena automatically. Still true for the
-  stable C API (v1, `duckdb_extension.h`) as of DuckDB v1.5.5/v1.5.6.
+  stable C API (v1, `duckdb_extension.h`) as of DuckDB v2.0.0.
 
   Upstream: duckdb/duckdb#25163, filed 2026-08-30, argument kept in
   `docs/upstream-issue-filter-pushdown.md`. Closed 2026-10-13 as "fixed on
   nightly" — checked against the actual commit (`src/main/capi/v2/capi_v2_func_table.cpp`,
   Oct 7-11 2026, branch `v2.0-cyanoptera`) and it isn't usable yet:
 
-  - It shipped in a brand-new, unreleased **C API v2**, not as an addition to
-    the stable v1 API this extension builds against. No tagged DuckDB release
-    contains it.
+  - It shipped in a brand-new **C API v2**, not as an addition to the stable
+    v1 API this extension builds against.
   - The shape differs from what was requested: no column/comparator/constant
     accessors. The callback (`duckdb_v2_table_function_set_filter_pushdown_callback`)
     hands over `duckdb_v2_expression_handle` nodes
     (`..._filter_pushdown_get_filter`) to walk via the v2 expression API, and
     an index-based `..._accept` to mark each one handled.
   - `quack-rs` (the Rust wrapper this extension depends on) has no path to it:
-    0.18.0, its latest release as of 2026-10-02, states in its own changelog
-    that it "still targets [C API] v1.2.0."
+    0.19.0, its latest release as of 2026-10-23, states in its own changelog
+    that DuckDB 2.0 loads a v2 pushdown binary "only through a C API v2 entry
+    point (`<name>_init_c_api_v2`), which quack-rs does not generate."
 
-  Revisit when either lands: `quack-rs` ships v2 support, or DuckDB 2.0 cuts a
-  release with a stable v2 API. Until then this stays blocked — not on a
-  missing feature anymore, but on an unstable, unreleased, unwrapped one.
+  **Still blocked as of DuckDB 2.0.0 "Cyanoptera" (released 2026-10-21).**
+  DuckDB's own 2.0 announcement is explicit that C API v2 is not yet marked
+  stable — the team wants field testing first. So the release that was
+  supposed to resolve this changed nothing here: v2 is in a tagged release
+  now, but it's still unstable and `quack-rs` still doesn't wrap it. Revisit
+  when either lands: `quack-rs` adds v2 support, or DuckDB marks v2 stable.
   Manual `predicate=` is the supported path meanwhile, and on partitioned
   tables it already prunes.
 
