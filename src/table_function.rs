@@ -59,10 +59,11 @@ struct ScanBindData {
 
 /// Lazily fetches the next Athena result page: `None` at end of stream, `Err`
 /// on a page-fetch failure. Boxing keeps the concrete paginator type internal
-/// to `read_athena_init` (no smithy types to name here). It is `Send + 'static`
-/// — all `FfiInitData` requires. `athena_scan` registers no `local_init` and
-/// never raises `max_threads` above DuckDB's default of 1, so `read_athena`
-/// runs single-threaded and this need not be `Sync`.
+/// to `read_athena_init` (no smithy types to name here). `athena_scan`
+/// registers no `local_init` and never raises `max_threads` above DuckDB's
+/// default of 1, so `read_athena` runs single-threaded; the `Mutex` exists
+/// only to satisfy `FfiInitData::set`'s `Send + Sync` bound, never to
+/// coordinate real concurrent access.
 type PageFetcher = Box<dyn FnMut() -> Option<Result<GetQueryResultsOutput, String>> + Send>;
 
 /// How the scan reads the finished query's results.
@@ -74,7 +75,7 @@ enum ScanMode {
     /// using Athena-managed query results) or S3 is unreadable: page
     /// `GetQueryResults` 1000 rows at a time.
     Pages {
-        next_page: PageFetcher,
+        next_page: std::sync::Mutex<PageFetcher>,
         /// The first Athena page's first row is the column header, skipped once.
         first_page: bool,
     },
@@ -132,7 +133,7 @@ unsafe extern "C" fn read_athena(info: duckdb_function_info, output: duckdb_data
             ScanMode::Pages {
                 next_page,
                 first_page,
-            } => match next_page() {
+            } => match next_page.get_mut().expect("single-threaded scan")() {
                 Some(Ok(page)) => {
                     let was_first = *first_page;
                     *first_page = false;
@@ -675,7 +676,13 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
         let maxrows = if maxrows_val.is_null() {
             0
         } else {
-            maxrows_val.as_i32()
+            match maxrows_val.as_i32() {
+                Some(v) => v,
+                None => {
+                    bi.set_error("maxrows must fit in a 32-bit integer");
+                    return;
+                }
+            }
         };
 
         // Positive integer, in seconds, or the default ceiling. A query still
@@ -685,7 +692,11 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
         let timeout = if timeout_val.is_null() {
             DEFAULT_POLL_WAIT
         } else {
-            match parse_timeout_seconds(timeout_val.as_i32()) {
+            let Some(seconds) = timeout_val.as_i32() else {
+                bi.set_error("timeout_seconds must fit in a 32-bit integer");
+                return;
+            };
+            match parse_timeout_seconds(seconds) {
                 Ok(d) => d,
                 Err(e) => {
                     bi.set_error(&e);
@@ -700,7 +711,11 @@ unsafe extern "C" fn read_athena_bind(bind_info: duckdb_bind_info) {
         let result_reuse_minutes = if reuse_val.is_null() {
             None
         } else {
-            match parse_reuse_minutes(reuse_val.as_i32()) {
+            let Some(minutes) = reuse_val.as_i32() else {
+                bi.set_error("result_reuse_minutes must fit in a 32-bit integer");
+                return;
+            };
+            match parse_reuse_minutes(minutes) {
                 Ok(m) => Some(m),
                 Err(e) => {
                     bi.set_error(&e);
@@ -977,7 +992,7 @@ fn paged_mode(client: &AthenaClient, query_execution_id: &str) -> ScanMode {
             .map(|r| r.map_err(|e| e.to_string()))
     });
     ScanMode::Pages {
-        next_page,
+        next_page: std::sync::Mutex::new(next_page),
         first_page: true,
     }
 }
@@ -1005,7 +1020,10 @@ unsafe extern "C" fn read_athena_init(info: duckdb_init_info) {
         // scan fewer bytes. Falls back to all columns when nothing is projected.
         let init = InitInfo::new(info);
         let projected: Vec<usize> = (0..init.projected_column_count())
-            .map(|i| init.projected_column_index(i))
+            .map(|i| {
+                init.projected_column_index(i)
+                    .expect("index within projected_column_count() is always valid")
+            })
             .collect();
         let select_list =
             projected_select_list(&bind_data.columns, &bind_data.col_types, &projected);

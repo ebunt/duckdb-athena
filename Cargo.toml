@@ -4,7 +4,7 @@ version = "0.4.0"
 edition = "2021"
 
 [dependencies]
-quack-rs = "=0.11.0"
+quack-rs = "=0.19.0"
 libduckdb-sys = { version = ">=1.4.4, <2", features = ["loadable-extension"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 aws-config = "1"
@@ -21,5 +21,5 @@ crate-type = ["cdylib"]
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 strip = true
