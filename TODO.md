@@ -19,111 +19,103 @@ Last reviewed 2026-11-14 against DuckDB 2.0.0 (2.0.1 is due 2026-11-18).
 The shipped artifact stays on v1. The v2 build is kept green in CI so it is
 ready when v2 stabilizes.
 
-## Before releasing 0.4.1
+## Releasing 0.4.1
 
-Done on 2026-11-16: `scripts/live-check.sh` passed on a fresh `make release`
-of the refactored scan, `scripts/cancel-check.sh` confirmed the interrupt leak
-against real Athena (item 5), and the `extension-ci-tools` submodule moved to
-`c286b12` on `v2.0-cyanoptera`.
-
-1. **Merge, tag, repin.** Push `duckdb-2.0-migration`, merge it, and tag the
-   merge commit `v0.4.1` (the crate and descriptor versions are already
-   bumped; the tag triggers `release.yml`). Then set `ref` in
-   `docs/community-extension-description.yml` to that merge commit: it still
-   names the 0.4.0 one. Before submitting, confirm `v2.0-cyanoptera` is the
-   `extension-ci-tools` ref duckdb/community-extensions builds 2.0 extensions
-   with. A local build keeps reporting v0.4.0 until
-   `configure/extension_version.txt` is removed and `make configure` re-run.
+Merged as `5d9e225` (#35) and tagged `v0.4.1`; the descriptor `ref` names that
+commit. Before submitting to duckdb/community-extensions, confirm
+`v2.0-cyanoptera` is the `extension-ci-tools` ref it builds 2.0 extensions
+with. Live checks passed on 2026-11-16, and `scripts/cancel-check.sh` confirmed
+the interrupt leak against real Athena (item 4).
 
 ## C API v2 track
 
-2. **Accept pushed filters once upstream settles.** Filters are pushed but not
+1. **Accept pushed filters once upstream settles.** Filters are pushed but not
    accepted, so DuckDB re-checks every row. That is deliberate: it makes the
    known v2 defects harmless (duckdb/duckdb#27729, `BETWEEN` bounds not
    exposed; #27475, accepted filters lost across plan serialization). When
    both are fixed in a release, accept filters whose semantics are exact and
    keep the rest advisory.
-3. **Widen what is pushed.** Not yet lowered: a bare boolean column
+2. **Widen what is pushed.** Not yet lowered: a bare boolean column
    (`WHERE shipped`), `NOT IN`, `LIKE 'prefix%'`, `IS DISTINCT FROM`, and
    comparisons where DuckDB cast the column rather than the constant. Float
-   and double are excluded on purpose; revisit only with accept (item 2).
-4. **Parallel scan** via local init and `max_threads`, once results arrive as
-   multiple objects (item 8).
+   and double are excluded on purpose; revisit only with accept (item 1).
+3. **Parallel scan** via local init and `max_threads`, once results arrive as
+   multiple objects (item 7).
 
 ## Both builds
 
-5. **Stop the Athena query when the DuckDB query is interrupted.** Confirmed
+4. **Stop the Athena query when the DuckDB query is interrupted.** Confirmed
    broken, against the fake and against real Athena (2026-11-16: `RUNNING` at
    interrupt, `SUCCEEDED` afterwards): neither C API tells a table function it was interrupted, so the
    poll loop runs until Athena finishes and the query bills in full (an
    interrupt at 1s was honoured at 8s). `tests/e2e` holds this as a strict
    xfail. Options, none free:
-   - Ask upstream for an interrupt check on the v2 table-function context
-     (the v2 feedback thread lists interruption as expected "eventually").
+   - Ask upstream for an interrupt check on the table-function context.
+     Drafted in `docs/upstream-issue-interrupt.md`, not filed yet.
    - Watch SIGINT inside the extension (`tokio::signal`) and stop the query.
      Works for the CLI; intrusive for a library, and blind to
      `connection.interrupt()` from Python or JDBC.
-6. **Raise the floor to DuckDB 1.5** once 1.4 leaves support (2026-11-17).
+5. **Raise the floor to DuckDB 1.5** once 1.4 leaves support (2026-11-17).
    Building with a quack-rs `duckdb-1-5*` feature (stamped v1.5.6) unlocks
    config options and the client context: `SET athena_workgroup = ...`,
    `athena_output_location`, `athena_region`, `athena_profile` as session
    defaults instead of repeating named parameters. Cost: no more 1.4 loads.
    Investigate whether DuckDB secrets (`CREATE SECRET (TYPE s3)`) can supply
    credentials on this path.
-7. **`athena_query('SELECT ...')`.** Arbitrary SQL passthrough. The schema
+6. **`athena_query('SELECT ...')`.** Arbitrary SQL passthrough. The schema
     must be known at bind, so either run the query at bind and reuse the
     execution in init, or describe it via a prepared statement.
-8. **`UNLOAD` to Parquet instead of CSV.** `UNLOAD (SELECT ...) TO 's3://...'
+7. **`UNLOAD` to Parquet instead of CSV.** `UNLOAD (SELECT ...) TO 's3://...'
     WITH (format = 'PARQUET')` returns typed, columnar, multi-file results. It
     removes the CSV dialect parser, the text-to-type conversions and the JSON
     detour for nested types, and enables parallel reads. Needs a writable
     prefix, cleanup of the unloaded files, and a Parquet reader. Largest change
     here; measure against the current 1.07M rows in about 3s first.
-9. **Native `LIST`/`STRUCT`/`MAP`.** Currently JSON text via
+8. **Native `LIST`/`STRUCT`/`MAP`.** Currently JSON text via
     `CAST(col AS JSON)`. Going native on the CSV path needs a recursive Glue
-    type parser and nested vector writes in both adapters. Item 8 would make
+    type parser and nested vector writes in both adapters. Item 7 would make
     most of this unnecessary.
-10. **`catalog=` parameter** for cross-account Glue catalogs (`CatalogId`) and
+9. **`catalog=` parameter** for cross-account Glue catalogs (`CatalogId`) and
     Athena federated data catalogs.
-11. **Better cardinality.** The estimate is `maxrows`, else Glue's
+10. **Better cardinality.** The estimate is `maxrows`, else Glue's
     `recordCount`/`numRows`, and ignores `predicate=` and pushed filters. On
     partitioned tables, partition counts from Glue would tighten it.
 
 ## Build, CI and release
 
-12. **Dependency auditing.** Add `cargo deny` or `cargo audit` to CI. An
+11. **Dependency auditing.** Add `cargo deny` or `cargo audit` to CI. An
     earlier lockfile carried `zip` 6.0.0 via `libduckdb-sys` 1.10502.0, which
     had open RustSec advisories.
-13. **Declare an MSRV.** `libduckdb-sys` 1.20000.x needs Rust 1.88. Set
+12. **Declare an MSRV.** `libduckdb-sys` 1.20000.x needs Rust 1.88. Set
     `rust-version` in `Cargo.toml` after confirming the AWS SDK's own floor.
-14. **Platforms.** Enable `linux_arm64` first (Graviton), after building and
+13. **Platforms.** Enable `linux_arm64` first (Graviton), after building and
     load-testing it here. Leave `osx_amd64` excluded; DuckDB is phasing it out
     in 2.1.
-15. **Follow DuckDB patch releases.** Add each to the `load` matrix in
+14. **Follow DuckDB patch releases.** Add each to the `load` matrix in
     `ci.yml`. The v2 build moves only when `duckdb-neo` and `libduckdb-sys`
     publish for the new version; bump them with `V2_DUCKDB_VERSION` and the
     `api_version` in `src/v2.rs`.
 
 ## Testing
 
-16. **Grow the fake AWS** (`tests/e2e/fake_aws.py`) where it is thin: short
+15. **Grow the fake AWS** (`tests/e2e/fake_aws.py`) where it is thin: short
     reads and truncated result objects, an unreadable result location (the
     paging fallback's other trigger), a refused `StopQueryExecution`, result
     reuse, and `profile=`/`region=` resolution.
-17. **Live checks not yet scripted**: the managed-results paging fallback and
+16. **Live checks not yet scripted**: the managed-results paging fallback and
     the `DATE`/`TIMESTAMP`/`DECIMAL` round trip (both verified by hand on
     2026-08-30).
-18. **Live pushdown check for the v2 build**: assert `DataScannedInBytes`
+17. **Live pushdown check for the v2 build**: assert `DataScannedInBytes`
     drops on the partitioned fixture when a plain `WHERE` names the partition
     column. The fake cannot show pruning.
 
 ## Cleanup
 
-19. Work through `AUDIT.md`: `project/` duplicates `QUERIES.md` and
+18. Work through `AUDIT.md`: `project/` duplicates `QUERIES.md` and
     `live-check.sh`; README repeats `QUERIES.md`; the predicate preflight is a
     partial SQL lexer that could shrink to explicit safety checks.
-20. Drop the "Work in progress" banner from `README.md`, or say what is.
-21. Add a `ruff` config for `tests/` and `scripts/` so Python formatting is
+19. Drop the "Work in progress" banner from `README.md`, or say what is.
+20. Add a `ruff` config for `tests/` and `scripts/` so Python formatting is
     checked in CI rather than by hand.
 
 ## Assumptions, and what backs them
