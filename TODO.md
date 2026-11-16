@@ -1,115 +1,145 @@
 # TODO
 
-Current state: `athena_scan` registers schema from Glue in `read_athena_bind`,
-reads DuckDB's projected columns in `read_athena_init`, submits
-`SELECT <projection> FROM "db"."table" [WHERE predicate] [LIMIT n]` to Athena,
-then streams the result CSV Athena wrote to S3 — one `GetObject`, parsed
-incrementally, a vector of rows per `read_athena` call, so peak memory stays
-near one byte chunk. `GetQueryResults` paging (1000 rows per call) remains only
-as the fallback for executions exposing no S3 location, e.g. Athena-managed
-query results. Column projection is pushed into Athena; filtering with
-`predicate=` is manual, and a plain DuckDB `WHERE` runs locally after rows
-return. A `predicate=` is checked at bind: no statement separators, comments or
-statement keywords, and every column it names must exist in the Glue schema.
+Recommendations for `athena_scan`, in rough priority order within each section.
+Last reviewed 2026-11-14 against DuckDB 2.0.0 (2.0.1 is due 2026-11-18).
 
-## Not done
+## Where DuckDB 2.0 leaves this extension
 
-- **Native `LIST`/`STRUCT`/`MAP` for complex columns.** They currently arrive as
-  JSON text (`CAST(col AS JSON)`), which is queryable via DuckDB's json
-  functions. Going native needs a recursive parser for Glue type strings, the
-  nested logical-type constructors, and writing nested vectors through raw FFI
-  (`duckdb_list_vector_reserve`/`set_size`/`get_child`, `duckdb_struct_vector_get_child`;
-  quack-rs wraps none of these, and DuckDB's `MAP` is a `LIST` of
-  `STRUCT(key, value)` underneath). Roughly a week, most of it unsafe code.
+- **Stable C API (v1, `duckdb_extension.h`)**: what the published build uses.
+  2.0.0 adds two functions to it over v1.5.6 (`duckdb_create_timestamp_tz_ns`,
+  `duckdb_get_timestamp_tz_ns`); nothing new for table functions. One build
+  stamped `C_STRUCT` / `v1.2.0` loads in DuckDB 1.4.4, 1.5.6 and 2.0.0, and CI
+  now checks that on every push.
+- **C API v2 (`duckdb_extension_v2.h`)**: new in 2.0, unstable, one build per
+  DuckDB version. `make release_v2` builds this extension on it through
+  `duckdb-neo`, with filter pushdown, a progress callback and bind-time
+  cardinality. Maintainers have suggested stabilizing function registration
+  "for 2.1" (2027 H1).
 
-## Blocked
+The shipped artifact stays on v1. The v2 build is kept green in CI so it is
+ready when v2 stabilizes.
 
-- **Optimizer-driven filter pushdown.** `libduckdb-sys` exposes projection
-  pushdown but no table-filter callback / `duckdb_table_filter` accessors, so a
-  plain `WHERE` cannot be pushed into Athena automatically. Still true for the
-  stable C API (v1, `duckdb_extension.h`) as of DuckDB v1.5.5/v1.5.6.
+## Before releasing 0.4.1
 
-  Upstream: duckdb/duckdb#25163, filed 2026-08-30, argument kept in
-  `docs/upstream-issue-filter-pushdown.md`. Closed 2026-10-13 as "fixed on
-  nightly" — checked against the actual commit (`src/main/capi/v2/capi_v2_func_table.cpp`,
-  Oct 7-11 2026, branch `v2.0-cyanoptera`) and it isn't usable yet:
+Done on 2026-11-16: `scripts/live-check.sh` passed on a fresh `make release`
+of the refactored scan, `scripts/cancel-check.sh` confirmed the interrupt leak
+against real Athena (item 5), and the `extension-ci-tools` submodule moved to
+`c286b12` on `v2.0-cyanoptera`.
 
-  - It shipped in a brand-new, unreleased **C API v2**, not as an addition to
-    the stable v1 API this extension builds against. No tagged DuckDB release
-    contains it.
-  - The shape differs from what was requested: no column/comparator/constant
-    accessors. The callback (`duckdb_v2_table_function_set_filter_pushdown_callback`)
-    hands over `duckdb_v2_expression_handle` nodes
-    (`..._filter_pushdown_get_filter`) to walk via the v2 expression API, and
-    an index-based `..._accept` to mark each one handled.
-  - `quack-rs` (the Rust wrapper this extension depends on) has no path to it:
-    0.18.0, its latest release as of 2026-10-02, states in its own changelog
-    that it "still targets [C API] v1.2.0."
+1. **Merge, tag, repin.** Push `duckdb-2.0-migration`, merge it, and tag the
+   merge commit `v0.4.1` (the crate and descriptor versions are already
+   bumped; the tag triggers `release.yml`). Then set `ref` in
+   `docs/community-extension-description.yml` to that merge commit: it still
+   names the 0.4.0 one. Before submitting, confirm `v2.0-cyanoptera` is the
+   `extension-ci-tools` ref duckdb/community-extensions builds 2.0 extensions
+   with. A local build keeps reporting v0.4.0 until
+   `configure/extension_version.txt` is removed and `make configure` re-run.
 
-  Revisit when either lands: `quack-rs` ships v2 support, or DuckDB 2.0 cuts a
-  release with a stable v2 API. Until then this stays blocked — not on a
-  missing feature anymore, but on an unstable, unreleased, unwrapped one.
-  Manual `predicate=` is the supported path meanwhile, and on partitioned
-  tables it already prunes.
+## C API v2 track
 
-## Deferred
+2. **Accept pushed filters once upstream settles.** Filters are pushed but not
+   accepted, so DuckDB re-checks every row. That is deliberate: it makes the
+   known v2 defects harmless (duckdb/duckdb#27729, `BETWEEN` bounds not
+   exposed; #27475, accepted filters lost across plan serialization). When
+   both are fixed in a release, accept filters whose semantics are exact and
+   keep the rest advisory.
+3. **Widen what is pushed.** Not yet lowered: a bare boolean column
+   (`WHERE shipped`), `NOT IN`, `LIKE 'prefix%'`, `IS DISTINCT FROM`, and
+   comparisons where DuckDB cast the column rather than the constant. Float
+   and double are excluded on purpose; revisit only with accept (item 2).
+4. **Parallel scan** via local init and `max_threads`, once results arrive as
+   multiple objects (item 8).
 
-- **Live AWS integration tests.** Gate behind env vars (`ATHENA_TEST_DATABASE`,
-  `ATHENA_TEST_TABLE`, `ATHENA_TEST_OUTPUT`); assert partition predicates reduce
-  `data_scanned_in_bytes`. Not wired into CI (needs credentials + fixtures).
+## Both builds
 
-  Both paths that had only unit coverage have since been checked by hand
-  against live Athena (2026-08-30), on throwaway resources deleted afterwards:
+5. **Stop the Athena query when the DuckDB query is interrupted.** Confirmed
+   broken, against the fake and against real Athena (2026-11-16: `RUNNING` at
+   interrupt, `SUCCEEDED` afterwards): neither C API tells a table function it was interrupted, so the
+   poll loop runs until Athena finishes and the query bills in full (an
+   interrupt at 1s was honoured at 8s). `tests/e2e` holds this as a strict
+   xfail. Options, none free:
+   - Ask upstream for an interrupt check on the v2 table-function context
+     (the v2 feedback thread lists interruption as expected "eventually").
+   - Watch SIGINT inside the extension (`tokio::signal`) and stop the query.
+     Works for the CLI; intrusive for a library, and blind to
+     `connection.interrupt()` from Python or JDBC.
+6. **Raise the floor to DuckDB 1.5** once 1.4 leaves support (2026-11-17).
+   Building with a quack-rs `duckdb-1-5*` feature (stamped v1.5.6) unlocks
+   config options and the client context: `SET athena_workgroup = ...`,
+   `athena_output_location`, `athena_region`, `athena_profile` as session
+   defaults instead of repeating named parameters. Cost: no more 1.4 loads.
+   Investigate whether DuckDB secrets (`CREATE SECRET (TYPE s3)`) can supply
+   credentials on this path.
+7. **`athena_query('SELECT ...')`.** Arbitrary SQL passthrough. The schema
+    must be known at bind, so either run the query at bind and reuse the
+    execution in init, or describe it via a prepared statement.
+8. **`UNLOAD` to Parquet instead of CSV.** `UNLOAD (SELECT ...) TO 's3://...'
+    WITH (format = 'PARQUET')` returns typed, columnar, multi-file results. It
+    removes the CSV dialect parser, the text-to-type conversions and the JSON
+    detour for nested types, and enables parallel reads. Needs a writable
+    prefix, cleanup of the unloaded files, and a Parquet reader. Largest change
+    here; measure against the current 1.07M rows in about 3s first.
+9. **Native `LIST`/`STRUCT`/`MAP`.** Currently JSON text via
+    `CAST(col AS JSON)`. Going native on the CSV path needs a recursive Glue
+    type parser and nested vector writes in both adapters. Item 8 would make
+    most of this unnecessary.
+10. **`catalog=` parameter** for cross-account Glue catalogs (`CatalogId`) and
+    Athena federated data catalogs.
+11. **Better cardinality.** The estimate is `maxrows`, else Glue's
+    `recordCount`/`numRows`, and ignores `predicate=` and pushed filters. On
+    partitioned tables, partition counts from Glue would tighten it.
 
-  - **`GetQueryResults` fallback** — a workgroup with
-    `ManagedQueryResultsConfiguration` enabled produces executions whose
-    `ResultConfiguration.OutputLocation` is null, so the scan pages instead of
-    reading S3. `sampledb.elb_logs` returned 4229 rows and `SUM(sentbytes)` of
-    35299472, identical to the S3 path; `maxrows=2500` capped correctly.
-  - **Native `DATE`/`TIMESTAMP`/`DECIMAL`** — a CTAS table with those Glue types
-    round-tripped exactly through both paths: pre-epoch `1969-12-31`, millisecond
-    timestamps, `DECIMAL(10,2)` values `-0.05`/`1234.56`/`0.00`, NULLs preserved
-    per column, and an empty string staying empty rather than becoming NULL.
+## Build, CI and release
 
-  Partitioned tables were checked on 2026-08-30 and behave correctly: Glue keeps
-  partition keys separate from data columns and Athena returns them last in
-  `SELECT *`, which is the order bind registers them in. Selecting only a
-  partition column reads 0 bytes (the values come from the catalog), and a
-  `predicate=` on a partition key prunes (284 -> 189 bytes on the fixture). Two
-  of these are now in `live-check.sh`, guarded on a partitioned fixture existing
-  (`ATHENA_TEST_PARTITIONED_TABLE`, default `default.claude_part_test`).
+12. **Dependency auditing.** Add `cargo deny` or `cargo audit` to CI. An
+    earlier lockfile carried `zip` 6.0.0 via `libduckdb-sys` 1.10502.0, which
+    had open RustSec advisories.
+13. **Declare an MSRV.** `libduckdb-sys` 1.20000.x needs Rust 1.88. Set
+    `rust-version` in `Cargo.toml` after confirming the AWS SDK's own floor.
+14. **Platforms.** Enable `linux_arm64` first (Graviton), after building and
+    load-testing it here. Leave `osx_amd64` excluded; DuckDB is phasing it out
+    in 2.1.
+15. **Follow DuckDB patch releases.** Add each to the `load` matrix in
+    `ci.yml`. The v2 build moves only when `duckdb-neo` and `libduckdb-sys`
+    publish for the new version; bump them with `V2_DUCKDB_VERSION` and the
+    `api_version` in `src/v2.rs`.
 
-  Neither of the two checks above is automated, but `scripts/live-check.sh` now
-  covers the rest:
-  value parity against Athena computing the same aggregates, a full scan
-  completing in seconds rather than paging, `maxrows`/`predicate` reaching
-  Athena, projection pushdown asserted against the SQL Athena actually
-  received, and an unknown predicate column being rejected at bind. Run it
-  before cutting a release; it needs credentials, so CI cannot.
+## Testing
+
+16. **Grow the fake AWS** (`tests/e2e/fake_aws.py`) where it is thin: short
+    reads and truncated result objects, an unreadable result location (the
+    paging fallback's other trigger), a refused `StopQueryExecution`, result
+    reuse, and `profile=`/`region=` resolution.
+17. **Live checks not yet scripted**: the managed-results paging fallback and
+    the `DATE`/`TIMESTAMP`/`DECIMAL` round trip (both verified by hand on
+    2026-08-30).
+18. **Live pushdown check for the v2 build**: assert `DataScannedInBytes`
+    drops on the partitioned fixture when a plain `WHERE` names the partition
+    column. The fake cannot show pruning.
+
+## Cleanup
+
+19. Work through `AUDIT.md`: `project/` duplicates `QUERIES.md` and
+    `live-check.sh`; README repeats `QUERIES.md`; the predicate preflight is a
+    partial SQL lexer that could shrink to explicit safety checks.
+20. Drop the "Work in progress" banner from `README.md`, or say what is.
+21. Add a `ruff` config for `tests/` and `scripts/` so Python formatting is
+    checked in CI rather than by hand.
 
 ## Assumptions, and what backs them
 
-- **One result object per query.** `open_result_csv` reads a single S3 object,
-  the execution's `ResultConfiguration.OutputLocation`. Tested at 53,513,100
-  rows (a cross join over nyctaxi), where Athena still wrote exactly one
-  553.7 MiB `<query-id>.csv` plus its `.metadata` sibling — no splitting. The
-  two ways this could go wrong are both handled rather than assumed: a location
-  that is not a readable object makes `GetObject` fail, which logs and falls
-  back to `GetQueryResults` paging, and a stream that ends early now fails
-  loudly because bytes read are checked against the object's `Content-Length`
-  (a cut on a row boundary parses cleanly and would otherwise be reported as a
-  complete, shorter result).
-
-## Predicate translation design (for whichever filter-pushdown API arrives)
-
-If/when native filter pushdown becomes available (C++ extension API, or a
-wrapped DuckDB C API v2):
-
-- Supported subset first: `=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT] NULL`,
-  `AND`, small `IN (...)` lists. Defer `OR`, `LIKE`, functions, casts,
-  arithmetic, and complex types. Never drop a filter unless DuckDB still
-  evaluates it locally.
-- Add a `predicate.rs` that lowers DuckDB filter expressions to an internal AST,
-  then renders Athena SQL — quoting column references from the schema and
-  rendering literals type-aware (numeric/boolean unquoted, strings SQL-escaped,
-  date/timestamp as typed literals). Unit-test each operator and escaping case.
+- **One result object per query.** `open_result_csv` reads the execution's
+  `ResultConfiguration.OutputLocation`. Tested at 53,513,100 rows: Athena wrote
+  one 553.7 MiB CSV. A location that is not a readable object falls back to
+  `GetQueryResults` paging, and a stream that ends early fails because bytes
+  read are checked against `Content-Length`.
+- **Partitioned tables.** Glue keeps partition keys separate and Athena returns
+  them last in `SELECT *`, matching bind order. Selecting only a partition
+  column reads 0 bytes; a `predicate=` on a partition key prunes. Covered by
+  `live-check.sh` when a partitioned fixture exists.
+- **v2 bind data belongs to one scan.** The pushdown callback stores its
+  predicate in bind data. A self-join and a CTE scanned twice with different
+  filters each got their own (covered in `tests/e2e/test_pushdown.py`). If
+  DuckDB ever shares bind data between scans, a second, different offer makes
+  the scan push nothing; since filters are never accepted the answer is still
+  right.

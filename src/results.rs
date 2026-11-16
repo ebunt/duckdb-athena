@@ -157,6 +157,16 @@ impl CsvRowStream {
         }
     }
 
+    /// Bytes of the result object read so far.
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    /// `Content-Length` of the result object, when S3 reported one.
+    pub fn content_length(&self) -> Option<u64> {
+        self.content_length
+    }
+
     /// Returns up to `max` rows; an empty vec means end of stream.
     pub fn next_rows(&mut self, max: usize) -> Result<Vec<ResultRow>, String> {
         let wanted = max + usize::from(!self.header_skipped);

@@ -16,6 +16,14 @@ core, not the C API.
 The text below is what was filed, kept here so the argument survives if the
 issue is closed.
 
+**Update, 2026-11-14 (DuckDB 2.0.0):** the stable v1 header is unchanged for
+table functions (2.0.0 adds only the two `TIMESTAMPTZ_NS` value functions to
+it). The new C API v2 does have what this asks for:
+`duckdb_v2_table_function_set_progress_callback` and
+`duckdb_v2_table_function_progress_set_progress`. v2 is unstable and pins a
+build to one DuckDB version, so the stderr heartbeat stays for now. Tracked in
+`TODO.md`.
+
 ---
 
 **Title:** C extension API: expose a progress callback for table functions

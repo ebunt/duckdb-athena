@@ -52,8 +52,19 @@ check() {
 }
 
 # Runs SQL through DuckDB with the extension loaded, one bare value out.
+# stderr carries the progress heartbeat on success, so it is shown only when
+# DuckDB exits non-zero -- a failed check then says why instead of "got ".
 duck() {
-    duckdb -unsigned -noheader -list -c "LOAD '$EXTENSION'; $1" 2>/dev/null
+    local out err status
+    err=$(mktemp)
+    out=$(duckdb -unsigned -noheader -list -c "LOAD '$EXTENSION'; $1" 2>"$err")
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        printf '     duckdb: %s\n' "$(tr '\n' ' ' <"$err" | cut -c1-400)" >&2
+    fi
+    rm -f "$err"
+    printf '%s' "$out"
+    return "$status"
 }
 
 # Runs SQL directly in Athena and returns the first data cell, so the
