@@ -33,9 +33,7 @@ repo:
   # carries both the MIT file `license:` claims and the current behaviour --
   # here, the one where a refused stop_query_execution is reported rather than
   # swallowed. Repin when anything user-visible lands on main.
-  # NOT YET REPINNED for 0.4.1: this still names the 0.4.0 commit. Set it to
-  # the merge commit of the 0.4.1 work before submitting.
-  ref: 2dc48e2a681fde1fb14b9868bc4321431cf073e5
+  ref: 5d9e225df0e3b5877b24138cdbbdcbaa95442023
 
 docs:
   hello_world: |
