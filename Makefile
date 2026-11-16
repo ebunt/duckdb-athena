@@ -65,12 +65,16 @@ release: unlink_packaged_release build_extension_library_release build_extension
 V2_DUCKDB_VERSION=v2.0.0
 V2_PACKAGED=build/v2/extension/$(EXTENSION_NAME)/$(EXTENSION_NAME).duckdb_extension
 
+# Built the way rust.Makefile builds `release`: same flags, and the same
+# --target when DUCKDB_PLATFORM names one (osx_arm64 does, which moves the
+# output under target/<triple>/). Without it the library lands in
+# target/release/ and the copy below looks in the wrong place.
 release_v2: check_configure
-	cargo build --release --features capi-v2
+	cargo build $(CARGO_OVERRIDE_DUCKDB_RS_FLAG) --release $(TARGET_INFO) --features capi-v2
 	$(PYTHON_VENV_BIN) -c "from pathlib import Path;Path('$(dir $(V2_PACKAGED))').mkdir(parents=True, exist_ok=True)"
 	rm -f $(V2_PACKAGED)
 	$(PYTHON_VENV_BIN) extension-ci-tools/scripts/append_extension_metadata.py \
-			-l $(TARGET_PATH)/release/$(RUST_LIBNAME) \
+			-l $(TARGET_PATH)/release$(IS_EXAMPLE)/$(RUST_LIBNAME) \
 			-o $(V2_PACKAGED) \
 			-n $(EXTENSION_NAME) \
 			-dv $(V2_DUCKDB_VERSION) \

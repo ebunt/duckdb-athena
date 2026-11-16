@@ -96,12 +96,22 @@ jobs:
   # for both platforms, so both are built and tested here first; it loads into
   # exactly one DuckDB version.
   capi-v2:
-    name: C API v2 (${{ matrix.runner }})
+    name: C API v2 (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, macos-15]
+        include:
+          - platform: linux_amd64
+            runner: ubuntu-latest
+          - platform: osx_arm64
+            runner: macos-15
+    # Set as release.yml sets it: on osx_arm64 it makes the build pass
+    # --target and put its output under target/aarch64-apple-darwin/, and
+    # v0.4.2's release failed on exactly that while this job, without it,
+    # passed.
+    env:
+      DUCKDB_PLATFORM: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v5
         with:
