@@ -67,6 +67,38 @@ make release
 
 This places the extension at `build/release/extension/athena/athena.duckdb_extension`.
 
+### Experimental: C API v2 build
+
+DuckDB 2.0 ships a second extension API with what the stable one lacks. A build
+against it pushes a plain DuckDB `WHERE` into Athena and moves DuckDB's
+progress bar:
+
+```bash
+make release_v2   # build/v2/extension/athena/athena.duckdb_extension
+```
+
+```sql
+-- "yr" = '2024' AND "qty" > 100 reach Athena; no predicate= needed
+SELECT * FROM athena_scan('orders') WHERE yr = '2024' AND qty > 100;
+```
+
+That API is unstable, so this binary loads into **DuckDB v2.0.0 only** and is
+not what gets published. Filters on integer, boolean, string, date, timestamp
+and decimal columns are pushed (`=`, `<>`, `<`, `<=`, `>`, `>=`, `BETWEEN`,
+`IN`, `IS [NOT] NULL`, `AND`, `OR`); everything else, floating point included,
+stays in DuckDB. DuckDB re-applies every pushed filter to the rows that come
+back, so pushdown can change what Athena scans but never the answer.
+
+### Tests without AWS
+
+`tests/e2e` runs real scans through the built extension against a fake Glue,
+Athena and S3, backed by an in-process DuckDB. No credentials needed:
+
+```bash
+make e2e      # the default build
+make e2e_v2   # the C API v2 build, including the pushdown tests
+```
+
 ## Releasing
 
 Pushing a `v*` tag triggers the release workflow (`.github/workflows/release.yml`):
@@ -90,7 +122,7 @@ the workflow manually from the Actions tab (`workflow_dispatch`).
 
 ## AWS credentials
 
-Set standard AWS environment variables, or use any credential source the AWS SDK supports (instance profile, SSO, `~/.aws/credentials`):
+Set standard AWS environment variables, or use any credential source the AWS SDK supports (instance profile, SSO, an `aws login` session, `~/.aws/credentials`):
 
 ```bash
 export AWS_ACCESS_KEY_ID=...
@@ -338,7 +370,7 @@ which would read as a measurement instead of an absence. Once real they are
 worth watching, being the bill as well as the progress.
 
 > **DuckDB's own progress bar stays at 0% for the whole wait.** Nothing in this
-> extension can move it: the C loadable-extension API's entire table-function
+> extension can move it: the stable (v1) C loadable-extension API's entire table-function
 > surface is bind/init/function, parameters, and projection pushdown — there is
 > no progress callback, though C++ table functions have `table_scan_progress`.
 > The heartbeat above scrolls that bar away, which is the trade this makes
@@ -390,7 +422,8 @@ SELECT COUNT(*) FROM athena_scan('my_table');
 
   A complex column whose nested types Athena cannot cast to JSON — `binary`/`varbinary`, `char`, `time`, or anything unrecognised — keeps the old plain-text rendering instead, since a rejected cast would fail the whole query. The decision is per column, so one such column does not affect the others.
 - `predicate=` is checked at bind only for what Athena cannot catch: it must be a single expression, with no semicolons, SQL comments, or statement keywords (matched as tokens, so `(SELECT` and `SELECT\n` are caught too — a subquery would otherwise scan and bill a table you never named). Column names are **not** pre-validated — Athena rejects an unknown column itself in about half a second having scanned 0 bytes (so at no cost), and its reason is surfaced verbatim: `COLUMN_NOT_FOUND: line 1:30: Column 'nosuchcol' cannot be resolved`. Pre-parsing the expression here meant maintaining a partial SQL grammar, which rejected valid queries such as `EXTRACT(year FROM ts) = 2024` whenever a keyword was missing from it
-- Automatic *filter* pushdown is not implemented — the DuckDB C loadable-extension API exposes projection pushdown but no table-filter callback, so `WHERE` clauses are evaluated in DuckDB after Athena returns rows. Use `predicate=` to push a filter into Athena manually.
+- Automatic *filter* pushdown is not in the published build — the stable DuckDB C loadable-extension API exposes projection pushdown but no table-filter callback, so `WHERE` clauses are evaluated in DuckDB after Athena returns rows. Use `predicate=` to push a filter into Athena manually, or see the experimental C API v2 build above.
+- Interrupting a query (Ctrl-C) does not stop the Athena query: neither C API tells a table function it was interrupted, so DuckDB waits for Athena to finish and the query is billed in full. `timeout_seconds=` does stop it.
 - Returns all rows by default; pass `maxrows=N` to cap (an outer DuckDB `LIMIT` is not pushed to Athena)
 - Results are streamed from the query's result CSV on S3 (one `GetObject`), which needs `s3:GetObject` on the results bucket. Workgroups using Athena-managed query results expose no S3 location, so those fall back to `GetQueryResults` paging at 1000 rows per call (~8 rows/ms)
 - Workgroup defaults to `primary`; override with `workgroup=`

@@ -43,3 +43,90 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked
+
+  # One build is meant to load in every supported DuckDB: it is stamped for the
+  # stable C API (C_STRUCT, v1.2.0) rather than for one release. Nothing else
+  # checks that, and a dependency bump can break it without failing a unit
+  # test. No AWS credentials needed: load-check.py stops at a bind error, and
+  # the e2e suite runs real scans against a fake Glue, Athena and S3.
+  load:
+    name: DuckDB ${{ matrix.duckdb }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest supported, last 1.x, current. Add each new release here.
+        duckdb: ["1.4.4", "1.5.6", "2.0.0"]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          # One cache for the whole matrix: the build does not depend on which
+          # DuckDB loads it afterwards.
+          shared-key: load
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Build debug extension
+        run: |
+          make configure
+          make debug
+
+      - name: Load the extension
+        run: |
+          uv run --no-project --with "duckdb==${{ matrix.duckdb }}" \
+            python scripts/load-check.py \
+            build/debug/extension/athena/athena.duckdb_extension
+
+      - name: End-to-end against a fake AWS
+        run: |
+          make e2e E2E_DUCKDB_VERSION="${{ matrix.duckdb }}" \
+            E2E_EXTENSION=build/debug/extension/athena/athena.duckdb_extension
+
+  # The experimental C API v2 build: filter pushdown and progress. Kept green
+  # so it is ready when DuckDB stabilizes that API, but never published -- it
+  # loads into exactly one DuckDB version.
+  capi-v2:
+    name: C API v2 (experimental)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: capi-v2
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Clippy
+        run: cargo clippy --locked --features capi-v2 --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --features capi-v2
+
+      - name: Build
+        run: |
+          make configure
+          make release_v2
+
+      - name: End-to-end against a fake AWS
+        run: make e2e_v2

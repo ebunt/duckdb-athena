@@ -1,5 +1,4 @@
-use libduckdb_sys::{duckdb_data_chunk, duckdb_data_chunk_get_vector, idx_t};
-use quack_rs::{types::TypeId, vector::VectorWriter};
+use quack_rs::types::TypeId;
 
 /// A DuckDB output type resolved from an Athena/Glue type string. Most types are
 /// a plain [`TypeId`]; `Decimal` additionally carries the width/scale needed to
@@ -234,28 +233,6 @@ fn decimal_fits(unscaled: i128, width: u8) -> bool {
     unscaled <= limit && unscaled >= -limit
 }
 
-/// Writes an unscaled decimal integer using the physical width DuckDB allocates
-/// for a `DECIMAL(width, _)`: int16 for 1..=4, int32 for 5..=9, int64 for
-/// 10..=18, int128 for 19..=38. Must match the width registered at bind, or the
-/// write lands at the wrong stride. A value that doesn't fit in `width` digits
-/// (possible even for the narrower physical types, whose range exceeds what the
-/// declared width allows) is written as NULL rather than truncated by the `as`
-/// cast.
-unsafe fn write_decimal(writer: &mut VectorWriter, row_idx: usize, width: u8, unscaled: i128) {
-    unsafe {
-        if !decimal_fits(unscaled, width) {
-            writer.set_null(row_idx);
-            return;
-        }
-        match width {
-            1..=4 => writer.write_i16(row_idx, unscaled as i16),
-            5..=9 => writer.write_i32(row_idx, unscaled as i32),
-            10..=18 => writer.write_i64(row_idx, unscaled as i64),
-            _ => writer.write_i128(row_idx, unscaled),
-        }
-    }
-}
-
 /// Julian day number of the Unix epoch (1970-01-01), used to turn a `time::Date`
 /// into days-since-epoch as DuckDB's `DATE` expects.
 const UNIX_EPOCH_JULIAN_DAY: i32 = 2_440_588;
@@ -270,7 +247,7 @@ const TIMESTAMP_FORMAT: &[time::format_description::BorrowedFormatItem<'_>] = ti
 /// malformed. `time::Date::parse` validates the day against the actual month
 /// length (leap years included), so an impossible date like `2024-02-31`
 /// becomes NULL rather than silently normalizing to a different valid day.
-fn parse_date(value: &str) -> Option<i32> {
+pub fn parse_date(value: &str) -> Option<i32> {
     let date = time::Date::parse(value, DATE_FORMAT).ok()?;
     Some(date.to_julian_day() - UNIX_EPOCH_JULIAN_DAY)
 }
@@ -278,7 +255,7 @@ fn parse_date(value: &str) -> Option<i32> {
 /// Parses an Athena `timestamp` (`YYYY-MM-DD HH:MM:SS[.ffffff]`) to microseconds
 /// since epoch, or `None` if malformed. Fractional seconds are truncated (not
 /// rounded) to microsecond precision, matching Athena/DuckDB behavior.
-fn parse_timestamp(value: &str) -> Option<i64> {
+pub fn parse_timestamp(value: &str) -> Option<i64> {
     let dt = time::PrimitiveDateTime::parse(value, TIMESTAMP_FORMAT).ok()?;
     let days = (dt.date().to_julian_day() - UNIX_EPOCH_JULIAN_DAY) as i64;
     let secs = dt.hour() as i64 * 3_600 + dt.minute() as i64 * 60 + dt.second() as i64;
@@ -286,87 +263,98 @@ fn parse_timestamp(value: &str) -> Option<i64> {
     Some((days * 86_400 + secs) * 1_000_000 + micros)
 }
 
-/// Writes one Athena cell into the DuckDB output vector.
+/// One Athena result cell, parsed into the value DuckDB stores for its column.
 ///
-/// `value` is `None` when Athena returned SQL NULL (the datum has no
-/// `varCharValue`). A numeric value that fails to parse is also written as
-/// NULL rather than silently left as a valid zero.
-pub unsafe fn populate_column(
-    value: Option<&str>,
-    col_type: ColType,
-    output: duckdb_data_chunk,
-    row_idx: usize,
-    col_idx: usize,
-) {
-    unsafe {
-        let vector = duckdb_data_chunk_get_vector(output, col_idx as idx_t);
-        let mut writer = VectorWriter::new(vector);
+/// Both engine adapters write from this, so "what does this text mean" has one
+/// answer; only "how is it put into a vector" differs between C API v1 and v2.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Cell<'a> {
+    Bool(bool),
+    I8(i8),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    F32(f32),
+    F64(f64),
+    /// Days since the Unix epoch.
+    Date(i32),
+    /// Microseconds since the Unix epoch.
+    Timestamp(i64),
+    /// The unscaled integer behind a `DECIMAL(width, _)`, already checked to
+    /// fit `width` digits. DuckDB stores it as int16 for widths 1..=4, int32
+    /// for 5..=9, int64 for 10..=18 and int128 for 19..=38.
+    Decimal {
+        unscaled: i128,
+        width: u8,
+    },
+    Text(&'a str),
+}
 
-        let Some(value) = value else {
-            writer.set_null(row_idx);
-            return;
-        };
-
-        let type_id = match col_type {
-            ColType::Decimal { width, scale } => {
-                match parse_decimal_value(value, scale) {
-                    Some(unscaled) => write_decimal(&mut writer, row_idx, width, unscaled),
-                    None => writer.set_null(row_idx),
-                }
-                return;
-            }
-            // JSON arrives as text and is written verbatim; DuckDB's json
-            // functions parse it on demand.
-            ColType::Json => TypeId::Varchar,
-            ColType::Simple(type_id) => type_id,
-        };
-
-        match type_id {
-            // Anything that is not true/false is unknown, not false. The old
-            // `== "true"` turned "1", "t" and any garbage into a confident
-            // `false` -- a wrong answer is worse than a missing one, and it
-            // survives aggregation silently.
-            TypeId::Boolean => match parse_bool(value) {
-                Some(b) => writer.write_bool(row_idx, b),
-                None => writer.set_null(row_idx),
-            },
-            TypeId::BigInt => match value.parse::<i64>() {
-                Ok(v) => writer.write_i64(row_idx, v),
-                Err(_) => writer.set_null(row_idx),
-            },
-            TypeId::Integer => match value.parse::<i32>() {
-                Ok(v) => writer.write_i32(row_idx, v),
-                Err(_) => writer.set_null(row_idx),
-            },
-            TypeId::TinyInt => match value.parse::<i8>() {
-                Ok(v) => writer.write_i8(row_idx, v),
-                Err(_) => writer.set_null(row_idx),
-            },
-            TypeId::SmallInt => match value.parse::<i16>() {
-                Ok(v) => writer.write_i16(row_idx, v),
-                Err(_) => writer.set_null(row_idx),
-            },
-            TypeId::Float => match value.parse::<f32>() {
-                Ok(v) => writer.write_f32(row_idx, v),
-                Err(_) => writer.set_null(row_idx),
-            },
-            TypeId::Double => match value.parse::<f64>() {
-                Ok(v) => writer.write_f64(row_idx, v),
-                Err(_) => writer.set_null(row_idx),
-            },
-            TypeId::Date => match parse_date(value) {
-                Some(days) => writer.write_date(row_idx, days),
-                None => writer.set_null(row_idx),
-            },
-            TypeId::Timestamp => match parse_timestamp(value) {
-                Some(micros) => writer.write_timestamp(row_idx, micros),
-                None => writer.set_null(row_idx),
-            },
-            // Varchar and any other type: write as string.
-            // SAFETY: only reached for types registered as Varchar with DuckDB.
-            _ => writer.write_varchar(row_idx, value),
+/// Parses one cell for a column of `col_type`. `None` is SQL NULL: either
+/// Athena returned NULL (`value` is `None`), or the text does not parse as the
+/// column's type. A value that fails to parse is never written as a default --
+/// a wrong zero or `false` survives aggregation silently, a NULL does not.
+pub fn parse_cell(value: Option<&str>, col_type: ColType) -> Option<Cell<'_>> {
+    let value = value?;
+    let type_id = match col_type {
+        // A value that doesn't fit in `width` digits (possible even for the
+        // narrower physical types, whose range exceeds what the declared
+        // width allows) is NULL rather than truncated by a cast.
+        ColType::Decimal { width, scale } => {
+            return parse_decimal_value(value, scale)
+                .filter(|unscaled| decimal_fits(*unscaled, width))
+                .map(|unscaled| Cell::Decimal { unscaled, width });
         }
+        // JSON arrives as text and is written verbatim; DuckDB's json
+        // functions parse it on demand.
+        ColType::Json => return Some(Cell::Text(value)),
+        ColType::Simple(type_id) => type_id,
+    };
+
+    match type_id {
+        // Anything that is not true/false is unknown, not false. The old
+        // `== "true"` turned "1", "t" and any garbage into a confident
+        // `false` -- a wrong answer is worse than a missing one, and it
+        // survives aggregation silently.
+        TypeId::Boolean => parse_bool(value).map(Cell::Bool),
+        TypeId::BigInt => value.parse().ok().map(Cell::I64),
+        TypeId::Integer => value.parse().ok().map(Cell::I32),
+        TypeId::TinyInt => value.parse().ok().map(Cell::I8),
+        TypeId::SmallInt => value.parse().ok().map(Cell::I16),
+        TypeId::Float => value.parse().ok().map(Cell::F32),
+        TypeId::Double => value.parse().ok().map(Cell::F64),
+        TypeId::Date => parse_date(value).map(Cell::Date),
+        TypeId::Timestamp => parse_timestamp(value).map(Cell::Timestamp),
+        // Varchar and any other type: only reached for types registered as
+        // Varchar with DuckDB.
+        _ => Some(Cell::Text(value)),
     }
+}
+
+/// Whether a DuckDB filter on a column of this Glue type may be sent to Athena.
+///
+/// Only types whose comparisons mean the same thing on both sides, and whose
+/// values survive the CSV round trip exactly. Left out on purpose: `float` and
+/// `double` (a filter evaluated on Athena's binary value and re-checked on the
+/// decimal text DuckDB parsed can disagree in the last digit), `char(n)`
+/// (padding), `binary`, and complex types.
+pub fn filter_pushable(col_type: &str) -> bool {
+    let normalized = col_type.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "boolean"
+            | "tinyint"
+            | "smallint"
+            | "int"
+            | "integer"
+            | "bigint"
+            | "date"
+            | "timestamp"
+            | "string"
+            | "varchar"
+            | "decimal"
+    ) || normalized.starts_with("varchar(")
+        || normalized.starts_with("decimal(")
 }
 
 #[cfg(test)]

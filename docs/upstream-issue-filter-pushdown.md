@@ -46,6 +46,13 @@ against it) adds DuckDB 2.0 *runtime* support for extensions built on the
 existing stable v1 API, but still does not wrap v2 or its filter-pushdown
 callback. So the blocker is unchanged: still an unstable, unwrapped API.
 
+**Update, 2026-11-14:** `quack-rs` 0.20.0 (2026-10-30) still does not generate
+the v2 entry point. `duckdb-neo`, DuckDB's own Rust wrapper for C API v2 with
+an `extension` module, is now on crates.io, so v2 is no longer unwrapped — only
+unstable. Known pushdown defects upstream: duckdb/duckdb#27729 (BETWEEN bounds
+not exposed) and #27475 (accepted filters across plan serialization). Plan in
+`TODO.md`.
+
 ---
 
 **Title:** C extension API: expose table filters to table functions (filter pushdown)

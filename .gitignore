@@ -6,3 +6,7 @@ AUDIT.md
 # extension-ci-tools build output
 build/
 configure/
+
+# python test caches
+__pycache__/
+.pytest_cache/
