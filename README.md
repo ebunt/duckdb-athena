@@ -67,11 +67,12 @@ make release
 
 This places the extension at `build/release/extension/athena/athena.duckdb_extension`.
 
-### Experimental: C API v2 build
+### C API v2 build (DuckDB 2.0.0 only)
 
 DuckDB 2.0 ships a second extension API with what the stable one lacks. A build
 against it pushes a plain DuckDB `WHERE` into Athena and moves DuckDB's
-progress bar:
+progress bar. Each release publishes it beside the standard build, as
+`athena-<platform>-duckdb-v2.0.0.tar.gz`, or build it yourself:
 
 ```bash
 make release_v2   # build/v2/extension/athena/athena.duckdb_extension
@@ -82,8 +83,8 @@ make release_v2   # build/v2/extension/athena/athena.duckdb_extension
 SELECT * FROM athena_scan('orders') WHERE yr = '2024' AND qty > 100;
 ```
 
-That API is unstable, so this binary loads into **DuckDB v2.0.0 only** and is
-not what gets published. Filters on integer, boolean, string, date, timestamp
+That API is unstable, so this binary loads into **DuckDB v2.0.0 only**; for
+any other version use the standard build. Filters on integer, boolean, string, date, timestamp
 and decimal columns are pushed (`=`, `<>`, `<`, `<=`, `>`, `>=`, `BETWEEN`,
 `IN`, `IS [NOT] NULL`, `AND`, `OR`); everything else, floating point included,
 stays in DuckDB. DuckDB re-applies every pushed filter to the rows that come

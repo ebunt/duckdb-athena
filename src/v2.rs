@@ -1,6 +1,7 @@
 //! The C API v2 adapter: `athena_scan` registered through duckdb-neo.
 //!
-//! Experimental. DuckDB 2.0's C API v2 is unstable, so a build with
+//! Published beside the standard build, but DuckDB 2.0's C API v2 is
+//! unstable, so a build with
 //! `--features capi-v2` loads into exactly one DuckDB version (the one
 //! `libduckdb-sys` is pinned to) and nothing else. In exchange it gets what the
 //! stable v1 API cannot offer:
