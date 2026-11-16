@@ -16,16 +16,29 @@ Last reviewed 2026-11-14 against DuckDB 2.0.0 (2.0.1 is due 2026-11-18).
   cardinality. Maintainers have suggested stabilizing function registration
   "for 2.1" (2027 H1).
 
-The shipped artifact stays on v1. The v2 build is kept green in CI so it is
-ready when v2 stabilizes.
+Each release publishes both: the v1 build for DuckDB 1.4 through 2.0, and the
+v2 build for DuckDB v2.0.0 only. community-extensions builds v1 only.
 
-## Releasing 0.4.1
+## Releasing 0.4.2
 
-Merged as `5d9e225` (#35) and tagged `v0.4.1`; the descriptor `ref` names that
-commit. Before submitting to duckdb/community-extensions, confirm
-`v2.0-cyanoptera` is the `extension-ci-tools` ref it builds 2.0 extensions
-with. Live checks passed on 2026-11-16, and `scripts/cancel-check.sh` confirmed
-the interrupt leak against real Athena (item 4).
+0.4.1 was merged (`5d9e225`, #35) and tagged, but never published: GitHub had
+retired the `macos-14` runner, so the macOS build could not start and the
+release job never ran. 0.4.2 carries the same code, builds macOS on
+`macos-15`, and publishes the C API v2 build beside the standard one.
+
+1. **Tag `v0.4.2`** on the merge commit of this change. The `v0.4.1` tag has no
+   release behind it; delete it (`git push origin --delete v0.4.1`) or leave
+   it.
+2. **Repin the descriptor.** `docs/community-extension-description.yml` names
+   `5d9e225` and version 0.4.1. The standard build is unchanged since, so that
+   commit builds the same extension; repin to the 0.4.2 merge commit before
+   submitting anyway, so the version matches the release. Also confirm
+   `v2.0-cyanoptera` is the `extension-ci-tools` ref community-extensions
+   builds 2.0 extensions with.
+
+Live checks passed on 2026-11-16 against the same scan code, and
+`scripts/cancel-check.sh` confirmed the interrupt leak against real Athena
+(item 4).
 
 ## C API v2 track
 

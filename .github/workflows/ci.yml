@@ -92,12 +92,16 @@ jobs:
           make e2e E2E_DUCKDB_VERSION="${{ matrix.duckdb }}" \
             E2E_EXTENSION=build/debug/extension/athena/athena.duckdb_extension
 
-  # The experimental C API v2 build: filter pushdown and progress. Kept green
-  # so it is ready when DuckDB stabilizes that API, but never published -- it
-  # loads into exactly one DuckDB version.
+  # The C API v2 build: filter pushdown and progress. release.yml publishes it
+  # for both platforms, so both are built and tested here first; it loads into
+  # exactly one DuckDB version.
   capi-v2:
-    name: C API v2 (experimental)
-    runs-on: ubuntu-latest
+    name: C API v2 (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-15]
     steps:
       - uses: actions/checkout@v5
         with:

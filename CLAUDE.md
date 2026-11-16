@@ -67,14 +67,16 @@ killed (SIGKILL, exit 137, nothing on stderr).
 `athena_init_c_api`. It adds filter pushdown and a progress callback. It is
 stamped `C_STRUCT_UNSTABLE` for `V2_DUCKDB_VERSION` and loads into exactly that
 DuckDB (the one `libduckdb-sys` is pinned to, `.duckdb-release` in that crate):
-bump the two together. Never publish it; `release.yml` and community-extensions
-build the default features. `quack-rs` stays a dependency of both builds for its
+bump the two together. `release.yml` publishes it beside the standard build
+as `athena-<platform>-duckdb-<V2_DUCKDB_VERSION>.tar.gz`, smoke-tested in
+exactly that DuckDB (it reads `V2_DUCKDB_VERSION` from the Makefile with
+`sed`). community-extensions builds only the default features. `quack-rs` stays a dependency of both builds for its
 `TypeId` enum, and `libduckdb-sys` compiles with both `loadable-extension`
 features at once; only one entry point is exported.
 
 ## Lint & format
 
-CI (`.github/workflows/release.yml`) runs `cargo fmt --check`, `cargo clippy` and `cargo test --locked` before building release binaries for 2 platforms (linux amd64, macOS arm64). Each is published as a `athena-<platform>.tar.gz` containing `athena.duckdb_extension` — the file name must stay exactly that, since DuckDB derives the init symbol (`athena_init_c_api`) from it. Run the same locally before pushing:
+CI (`.github/workflows/release.yml`) runs `cargo fmt --check`, `cargo clippy` and `cargo test --locked` before building release binaries for 2 platforms (linux amd64, macOS arm64; macOS on `macos-15`, since GitHub retired `macos-14`), each in two variants. The standard build is published as `athena-<platform>.tar.gz` and the C API v2 build as `athena-<platform>-duckdb-v2.0.0.tar.gz`, each containing `athena.duckdb_extension` — the file name must stay exactly that, since DuckDB derives the init symbol (`athena_init_c_api`) from it. Run the same locally before pushing:
 
 ```bash
 cargo fmt --check
@@ -84,7 +86,8 @@ cargo clippy --features capi-v2 --all-targets   # the v2 adapter is cfg'd out ot
 ```
 
 `ci.yml` also loads a debug build into DuckDB 1.4.4, 1.5.6 and 2.0.0 and runs
-the e2e suite on each, and builds and tests the C API v2 build.
+the e2e suite on each, and builds and tests the C API v2 build on Linux and
+macOS.
 
 ## Loading the extension in DuckDB
 

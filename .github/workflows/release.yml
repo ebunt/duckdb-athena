@@ -37,13 +37,24 @@ jobs:
             - name: Run tests
               run: cargo test --locked
 
+    # Two builds per platform:
+    #   stable   `make release`: the stable C API, loads in DuckDB 1.4 through 2.0.
+    #            Published as athena-<platform>.tar.gz, as before.
+    #   capi-v2  `make release_v2`: DuckDB 2.0's C API v2, with filter pushdown
+    #            and a moving progress bar. Unstable API, so it loads into exactly
+    #            one DuckDB version, which its asset is named after:
+    #            athena-<platform>-duckdb-v2.0.0.tar.gz.
+    # Both tarballs hold a file named athena.duckdb_extension, since DuckDB
+    # derives the init symbol from the file name.
     build:
-        name: Build ${{ matrix.platform }}
+        name: Build ${{ matrix.platform }} ${{ matrix.variant }}
         needs: check
         runs-on: ${{ matrix.runner }}
         strategy:
             fail-fast: false
             matrix:
+                platform: [linux_amd64, osx_arm64]
+                variant: [stable, capi-v2]
                 include:
                     - platform: linux_amd64
                       runner: ubuntu-latest
@@ -51,8 +62,14 @@ jobs:
                       # in (extension-ci-tools/docker/linux_amd64): glibc 2.28.
                       container: quay.io/pypa/manylinux_2_28_x86_64
                     - platform: osx_arm64
-                      runner: macos-14
+                      runner: macos-15
                       container: ''
+                    - variant: stable
+                      make_target: release
+                      out_dir: build/release/extension/athena
+                    - variant: capi-v2
+                      make_target: release_v2
+                      out_dir: build/v2/extension/athena
 
         container: ${{ matrix.container }}
 
@@ -82,17 +99,16 @@ jobs:
                   git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
             # The same targets duckdb/community-extensions runs, so this pipeline
-            # and that one build the extension identically. `make release` also
-            # appends the metadata footer and leaves the packaged extension at
-            # build/release/extension/athena/.
-            - name: Build release extension
+            # and that one build the stable extension identically. Both targets
+            # append the metadata footer, stamped with the same version.
+            - name: Build extension
               env:
                   DUCKDB_PLATFORM: ${{ matrix.platform }}
                   EXTENSION_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
               run: |
                   export EXTENSION_VERSION="${EXTENSION_VERSION:0:31}"
                   make configure
-                  make release
+                  make ${{ matrix.make_target }}
 
             # CI cannot boot another distro, but it can read what the binary
             # demands. This is the check that would have caught v0.3.0's asset,
@@ -101,7 +117,7 @@ jobs:
             - name: Assert the glibc baseline
               if: matrix.platform == 'linux_amd64'
               run: |
-                  max=$(strings build/release/extension/athena/athena.duckdb_extension \
+                  max=$(strings ${{ matrix.out_dir }}/athena.duckdb_extension \
                         | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
                   echo "highest glibc symbol required: $max"
                   if [ "$(printf '%s\n' "$max" "GLIBC_2.28" | sort -V | tail -1)" != "GLIBC_2.28" ]; then
@@ -112,52 +128,64 @@ jobs:
             - name: Package extension
               run: |
                   mkdir -p dist
+                  asset="athena-${{ matrix.platform }}"
+                  if [ "${{ matrix.variant }}" = "capi-v2" ]; then
+                    asset="$asset-duckdb-$(sed -n 's/^V2_DUCKDB_VERSION=//p' Makefile)"
+                  fi
                   # DuckDB derives the init symbol from the file name, so the file
-                  # must stay athena.duckdb_extension to match athena_init_c_api.
-                  # Ship it inside a platform-named tarball instead of renaming it.
-                  tar -czf "dist/athena-${{ matrix.platform }}.tar.gz" \
-                    -C build/release/extension/athena athena.duckdb_extension
+                  # must stay athena.duckdb_extension. Ship it inside a
+                  # descriptively named tarball instead of renaming it.
+                  tar -czf "dist/$asset.tar.gz" \
+                    -C ${{ matrix.out_dir }} athena.duckdb_extension
 
             - name: Upload build artifact
               uses: actions/upload-artifact@v7
               with:
-                  name: athena-${{ matrix.platform }}
-                  path: dist/athena-${{ matrix.platform }}.tar.gz
+                  name: ${{ matrix.platform }}-${{ matrix.variant }}
+                  path: dist/*.tar.gz
                   if-no-files-found: error
 
     smoke:
-        name: Smoke ${{ matrix.platform }}
+        name: Smoke ${{ matrix.platform }} ${{ matrix.variant }}
         needs: build
         runs-on: ${{ matrix.runner }}
         strategy:
             fail-fast: false
             matrix:
+                platform: [linux_amd64, osx_arm64]
+                variant: [stable, capi-v2]
                 include:
                     - platform: linux_amd64
                       runner: ubuntu-latest
                     - platform: osx_arm64
-                      runner: macos-14
+                      runner: macos-15
 
         steps:
+            - uses: actions/checkout@v5
+
             - name: Download build artifact
               uses: actions/download-artifact@v8
               with:
-                  name: athena-${{ matrix.platform }}
+                  name: ${{ matrix.platform }}-${{ matrix.variant }}
                   path: dist
+
+            - name: Unpack
+              run: tar -xzf dist/*.tar.gz
 
             # The installer is a bash script: piping it to sh runs it under
             # dash on Ubuntu, where `[[` is not a builtin, so platform
             # detection silently falls through to a 404 download.
             - name: Install DuckDB CLI
+              if: matrix.variant == 'stable'
               run: curl -fsSL https://install.duckdb.org | bash
 
             # Catches the failure mode that shipped in v0.2.0: an asset that
             # builds and uploads fine but cannot be loaded on its own platform.
             # No AWS credentials needed -- LOAD alone exercises the footer,
             # platform stamp and init symbol.
-            - name: Load the packaged extension
+            - name: Load the stable build in the latest DuckDB
+              if: matrix.variant == 'stable'
               run: |
-                  tar -xzf "dist/athena-${{ matrix.platform }}.tar.gz"
                   version=$(~/.duckdb/cli/latest/duckdb -unsigned -noheader -list -c "
                     LOAD '$PWD/athena.duckdb_extension';
                     SELECT extension_version FROM duckdb_extensions()
@@ -170,6 +198,23 @@ jobs:
                       echo "footer says $version, tag is ${{ github.ref_name }}"; exit 1; }
                   fi
 
+            - name: Install uv
+              if: matrix.variant == 'capi-v2'
+              uses: astral-sh/setup-uv@v6
+
+            # The v2 build loads into one DuckDB version only, so it is checked
+            # in exactly that version rather than the latest.
+            - name: Load the C API v2 build in its DuckDB
+              if: matrix.variant == 'capi-v2'
+              run: |
+                  duckdb_version=$(sed -n 's/^V2_DUCKDB_VERSION=//p' Makefile)
+                  expect=()
+                  if [ "${{ github.ref_type }}" = "tag" ]; then
+                    expect=(--expect-version "${{ github.ref_name }}")
+                  fi
+                  uv run --no-project --with "duckdb==${duckdb_version#v}" \
+                    python scripts/load-check.py "$PWD/athena.duckdb_extension" "${expect[@]}"
+
     github-release:
         name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -178,6 +223,8 @@ jobs:
         permissions:
             contents: write
         steps:
+            - uses: actions/checkout@v5
+
             - name: Download artifacts
               uses: actions/download-artifact@v8
               with:
@@ -188,7 +235,17 @@ jobs:
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
+                  v2=$(sed -n 's/^V2_DUCKDB_VERSION=//p' Makefile)
+                  cat > notes.md <<NOTES
+                  Unsigned DuckDB Athena extension builds for ${GITHUB_REF_NAME}.
+
+                  - \`athena-<platform>.tar.gz\`: the standard build. Loads in DuckDB 1.4.4 through 2.0. Use this one unless you want the extra features below.
+                  - \`athena-<platform>-duckdb-${v2}.tar.gz\`: built on DuckDB 2.0's C API v2, which adds filter pushdown (a plain \`WHERE\` reaches Athena) and a progress bar that moves. That API is still unstable, so this build loads in DuckDB ${v2} only.
+
+                  Each tarball holds \`athena.duckdb_extension\`; keep that file name. Load it with \`duckdb -unsigned\`.
+                  NOTES
+                  sed -i 's/^ *//' notes.md
                   gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz \
                     --repo "${GITHUB_REPOSITORY}" \
                     --title "${GITHUB_REF_NAME}" \
-                    --notes "Unsigned DuckDB Athena extension build for ${GITHUB_REF_NAME}."
+                    --notes-file notes.md

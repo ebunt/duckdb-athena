@@ -32,7 +32,7 @@ help:
 	@echo "  all         configure + release"
 	@echo "  release     build build/release/extension/$(EXTENSION_NAME)/$(EXTENSION_NAME).duckdb_extension"
 	@echo "  debug       debug build under build/debug/"
-	@echo "  release_v2  experimental C API v2 build under build/v2/ (never publish)"
+	@echo "  release_v2  C API v2 build under build/v2/ (loads in DuckDB $(V2_DUCKDB_VERSION) only)"
 	@echo "  e2e         end-to-end tests against a fake AWS (E2E_DUCKDB_VERSION=$(E2E_DUCKDB_VERSION))"
 	@echo "  e2e_v2      end-to-end tests for the v2 build"
 	@echo "  test        upstream SQL tests against the release build"
@@ -55,11 +55,13 @@ unlink_packaged_%:
 debug: unlink_packaged_debug build_extension_library_debug build_extension_with_metadata_debug
 release: unlink_packaged_release build_extension_library_release build_extension_with_metadata_release
 
-# Experimental: the same extension built on DuckDB 2.0's C API v2, which adds
-# filter pushdown and a moving progress bar. That API is unstable, so this
-# binary is stamped C_STRUCT_UNSTABLE and loads into exactly V2_DUCKDB_VERSION
-# -- the release libduckdb-sys is pinned to -- and nothing else. Never the
-# artifact to publish; `make release` is.
+# The same extension built on DuckDB 2.0's C API v2, which adds filter
+# pushdown and a moving progress bar. That API is unstable, so this binary is
+# stamped C_STRUCT_UNSTABLE and loads into exactly V2_DUCKDB_VERSION -- the
+# release libduckdb-sys is pinned to -- and nothing else. release.yml publishes
+# it beside the stable build, named for that version; community-extensions only
+# ever builds `make release`. release.yml reads this line with sed, so keep
+# it a plain `V2_DUCKDB_VERSION=vX.Y.Z`.
 V2_DUCKDB_VERSION=v2.0.0
 V2_PACKAGED=build/v2/extension/$(EXTENSION_NAME)/$(EXTENSION_NAME).duckdb_extension
 
