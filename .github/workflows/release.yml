@@ -200,7 +200,7 @@ jobs:
 
             - name: Install uv
               if: matrix.variant == 'capi-v2'
-              uses: astral-sh/setup-uv@v6
+              uses: astral-sh/setup-uv@v7
 
             # The v2 build loads into one DuckDB version only, so it is checked
             # in exactly that version rather than the latest.
