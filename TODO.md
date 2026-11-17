@@ -47,9 +47,10 @@ submission PR there.
    refreshes query progress from the client thread between tasks; when that
    thread picks up the scan, it blocks in `exec` for the whole Athena wait
    and the bar stays at its first reading. Always so with `SET threads = 1`,
-   occasionally otherwise (seen once in CI on a 3-core macOS runner,
-   2026-11-17). A fix needs a way to yield from `exec` without finishing,
-   which C API v2 does not expose yet.
+   and in 3 of 3 attempts on CI's macOS runner (2026-11-17), where the
+   progress test is a non-strict xfail; it moves on Linux CI and on a local
+   Mac. A fix needs a way to yield from `exec` without finishing, which C API
+   v2 does not expose yet.
 
 ## Both builds
 
