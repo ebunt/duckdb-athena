@@ -592,6 +592,19 @@ fn parse_optional_arg(name: &str, raw: Option<&str>) -> Result<Option<String>, S
     }
 }
 
+/// A named parameter, else the environment variable standing in for it as a
+/// session default. The parameter's own rules apply (explicitly empty is an
+/// error); an empty or blank variable counts as unset, the way `FOO=` is
+/// commonly used to clear one.
+fn arg_or_env(
+    name: &str,
+    raw: Option<&str>,
+    env: Option<String>,
+) -> Result<Option<String>, String> {
+    Ok(parse_optional_arg(name, raw)?
+        .or_else(|| env.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())))
+}
+
 fn build_athena_query(
     select_list: &str,
     database: &str,
@@ -624,12 +637,20 @@ pub fn bind_scan(args: ScanArgs) -> Result<ScanBindData, String> {
     // ResultConfiguration is sent and Athena applies the workgroup's own
     // config (location, encryption, ACL, managed results). An explicitly
     // empty value is an error, not a silent fallback.
-    let output_location = parse_optional_arg("output_location", args.output_location.as_deref())?;
+    let output_location = arg_or_env(
+        "output_location",
+        args.output_location.as_deref(),
+        std::env::var("ATHENA_OUTPUT_LOCATION").ok(),
+    )?;
 
-    // Workgroup defaults to `primary` when omitted; an explicitly empty
-    // value is an error.
-    let workgroup = parse_optional_arg("workgroup", args.workgroup.as_deref())?
-        .unwrap_or_else(|| "primary".to_owned());
+    // Workgroup defaults to ATHENA_WORKGROUP, else `primary`; an explicitly
+    // empty value is an error.
+    let workgroup = arg_or_env(
+        "workgroup",
+        args.workgroup.as_deref(),
+        std::env::var("ATHENA_WORKGROUP").ok(),
+    )?
+    .unwrap_or_else(|| "primary".to_owned());
 
     // maxrows > 0 caps the Athena query with `LIMIT n`. Unset (null) or any
     // value <= 0 (e.g. maxrows=-1) means no limit: return all rows so
@@ -1138,12 +1159,12 @@ impl SubmittedScan {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_athena_query, cardinality_estimate, combine_predicates, datum_row_to_result_row,
-        describe_target, error_chain, failure_message, glue_record_count, mask_string_literals,
-        next_poll_delay, parse_optional_arg, parse_reuse_minutes, parse_timeout_seconds,
-        progress_fraction, progress_line, projected_select_list, qualified_table,
-        result_output_location, result_row_cell, sleep_before_next_poll, timeout_message,
-        validate_predicate, POLL_INITIAL, POLL_MAX,
+        arg_or_env, build_athena_query, cardinality_estimate, combine_predicates,
+        datum_row_to_result_row, describe_target, error_chain, failure_message, glue_record_count,
+        mask_string_literals, next_poll_delay, parse_optional_arg, parse_reuse_minutes,
+        parse_timeout_seconds, progress_fraction, progress_line, projected_select_list,
+        qualified_table, result_output_location, result_row_cell, sleep_before_next_poll,
+        timeout_message, validate_predicate, POLL_INITIAL, POLL_MAX,
     };
     use crate::types::ColType;
     use aws_sdk_athena::operation::get_query_execution::GetQueryExecutionOutput;
@@ -1623,6 +1644,36 @@ mod tests {
     fn parse_optional_arg_rejects_explicit_empty() {
         assert!(parse_optional_arg("output_location", Some("")).is_err());
         assert!(parse_optional_arg("output_location", Some("   ")).is_err());
+    }
+
+    #[test]
+    fn named_parameter_beats_the_environment() {
+        assert_eq!(
+            arg_or_env("workgroup", Some("adhoc"), Some("etl".into())).unwrap(),
+            Some("adhoc".to_string())
+        );
+    }
+
+    #[test]
+    fn environment_fills_an_omitted_parameter() {
+        assert_eq!(
+            arg_or_env("workgroup", None, Some(" etl ".into())).unwrap(),
+            Some("etl".to_string())
+        );
+    }
+
+    #[test]
+    fn blank_environment_variable_is_unset() {
+        assert_eq!(
+            arg_or_env("workgroup", None, Some("  ".into())).unwrap(),
+            None
+        );
+        assert_eq!(arg_or_env("workgroup", None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn explicitly_empty_parameter_is_still_an_error_with_the_environment_set() {
+        assert!(arg_or_env("workgroup", Some(""), Some("etl".into())).is_err());
     }
 
     fn cols() -> Vec<String> {

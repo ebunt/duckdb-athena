@@ -208,6 +208,12 @@ SELECT * FROM athena_scan('my_table', workgroup='analytics');
 If no `output_location` is given and the workgroup has no result configuration,
 Athena rejects the query when it starts.
 
+To set either once per session rather than on every scan, export
+`ATHENA_WORKGROUP` or `ATHENA_OUTPUT_LOCATION`. They are read when each scan
+binds, so a named parameter still wins, and setting them from Python with
+`os.environ` takes effect on the next query. An empty variable counts as unset.
+Region and profile already have their own: `AWS_REGION` and `AWS_PROFILE`.
+
 ### Region
 
 Defaults to whatever the AWS config chain resolves — `AWS_REGION`, or the active
@@ -427,7 +433,7 @@ SELECT COUNT(*) FROM athena_scan('my_table');
 - Interrupting a query (Ctrl-C) does not stop the Athena query: neither C API tells a table function it was interrupted, so DuckDB waits for Athena to finish and the query is billed in full. `timeout_seconds=` does stop it.
 - Returns all rows by default; pass `maxrows=N` to cap (an outer DuckDB `LIMIT` is not pushed to Athena)
 - Results are streamed from the query's result CSV on S3 (one `GetObject`), which needs `s3:GetObject` on the results bucket. Workgroups using Athena-managed query results expose no S3 location, so those fall back to `GetQueryResults` paging at 1000 rows per call (~8 rows/ms)
-- Workgroup defaults to `primary`; override with `workgroup=`
+- Workgroup defaults to `ATHENA_WORKGROUP`, else `primary`; override with `workgroup=`
 - A value Athena returns that does not parse as its declared type becomes NULL,
   never a default. Booleans accept only `true`/`false` (case-insensitive): a `"1"`
   or `"t"` is NULL rather than `false`, since a wrong boolean would join the false

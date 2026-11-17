@@ -8,8 +8,9 @@ Last reviewed 2026-11-14 against DuckDB 2.0.0 (2.0.1 is due 2026-11-18).
 - **Stable C API (v1, `duckdb_extension.h`)**: what the published build uses.
   2.0.0 adds two functions to it over v1.5.6 (`duckdb_create_timestamp_tz_ns`,
   `duckdb_get_timestamp_tz_ns`); nothing new for table functions. One build
-  stamped `C_STRUCT` / `v1.2.0` loads in DuckDB 1.4.4, 1.5.6 and 2.0.0, and CI
-  now checks that on every push.
+  stamped `C_STRUCT` / `v1.2.0` loads in DuckDB 1.4.4, 1.5.6 and 2.0.0. CI
+  checks 1.5.6 and 2.0.0 on every push; 1.4 left support on 2026-11-17 and is
+  no longer tested.
 - **C API v2 (`duckdb_extension_v2.h`)**: new in 2.0, unstable, one build per
   DuckDB version. `make release_v2` builds this extension on it through
   `duckdb-neo`, with filter pushdown, a progress callback and bind-time
@@ -55,13 +56,18 @@ repo's submodule tracks. What remains is the submission PR there.
    - Watch SIGINT inside the extension (`tokio::signal`) and stop the query.
      Works for the CLI; intrusive for a library, and blind to
      `connection.interrupt()` from Python or JDBC.
-5. **Raise the floor to DuckDB 1.5** once 1.4 leaves support (2026-11-17).
-   Building with a quack-rs `duckdb-1-5*` feature (stamped v1.5.6) unlocks
-   config options and the client context: `SET athena_workgroup = ...`,
-   `athena_output_location`, `athena_region`, `athena_profile` as session
-   defaults instead of repeating named parameters. Cost: no more 1.4 loads.
-   Investigate whether DuckDB secrets (`CREATE SECRET (TYPE s3)`) can supply
-   credentials on this path.
+5. **`SET athena_*` session options: not worth it yet.** Session defaults
+   ship as environment variables instead (`ATHENA_WORKGROUP`,
+   `ATHENA_OUTPUT_LOCATION`; region and profile already have `AWS_REGION`
+   and `AWS_PROFILE`), and CI stopped testing 1.4 (2026-11-17). Real `SET`
+   options need quack-rs's `duckdb-1-5` feature, which per quack-rs 0.20.0
+   means stamping C API v1.5.6: refused by DuckDB 1.4 to 1.5.5, and under its
+   `Strict` policy refused by any release quack-rs does not list (2.0.1
+   included) until a quack-rs bump or a rebuild with
+   `QUACK_RS_TARGET_DUCKDB_VERSION`. Revisit if DuckDB declares config options
+   stable in the C API. DuckDB secrets cannot supply credentials on either
+   path: the C API has no `duckdb_secret_*` functions, and `duckdb_secrets()`
+   redacts the key.
 6. **`athena_query('SELECT ...')`.** Arbitrary SQL passthrough. The schema
     must be known at bind, so either run the query at bind and reuse the
     execution in init, or describe it via a prepared statement.
