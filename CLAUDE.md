@@ -85,7 +85,7 @@ cargo test --locked
 cargo clippy --features capi-v2 --all-targets   # the v2 adapter is cfg'd out otherwise
 ```
 
-`ci.yml` also loads a debug build into DuckDB 1.4.4, 1.5.6 and 2.0.0 and runs
+`ci.yml` also loads a debug build into DuckDB 1.5.6 and 2.0.0 and runs
 the e2e suite on each, and builds and tests the C API v2 build on Linux and
 macOS.
 
@@ -180,7 +180,7 @@ Athena supplies none, rather than trailing an empty colon.
 - `maxrows` is unlimited by default (no `LIMIT` clause); pass `maxrows=N` (> 0) to add `LIMIT N` to the Athena SQL. Unset or any value <= 0 (e.g. `maxrows=-1`) means all rows, so aggregates/joins see the full table
 - `database` defaults to `"default"` (the Glue database name)
 - Filter pushdown is not implemented — all filtering happens in DuckDB after the full scan; use `predicate=` to push a raw Athena `WHERE` predicate instead
-- The Athena query workgroup defaults to `primary`; override with the `workgroup=` named parameter
+- The Athena query workgroup defaults to `ATHENA_WORKGROUP`, else `primary`; override with the `workgroup=` named parameter. `ATHENA_OUTPUT_LOCATION` likewise stands in for an omitted `output_location=`. Both are read at bind (`arg_or_env`); a blank variable is unset, while an explicitly empty parameter is still an error. These replace `SET athena_*` options, which would need quack-rs's `duckdb-1-5` feature: a build stamped C API v1.5.6 that loads only in the DuckDB releases quack-rs lists (1.5.6 and 2.0.0 as of 0.20.0), so every patch release would need a rebuild
 - `profile=` selects a named profile from `~/.aws/config`, set as an explicit
   `ProfileFileCredentialsProvider` rather than via `loader.profile_name()`: that
   only tells the profile-file provider which profile to read, and the default chain

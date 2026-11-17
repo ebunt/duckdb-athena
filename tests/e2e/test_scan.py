@@ -251,3 +251,24 @@ def test_unknown_profile_is_named(con: duckdb.DuckDBPyConnection) -> None:
     scan = f"athena_scan('orders', database='{DATABASE}', profile='nope')"
     with pytest.raises(duckdb.Error, match="profile `nope` was not defined"):
         con.execute(f"SELECT COUNT(*) FROM {scan}").fetchall()
+
+
+def test_environment_supplies_session_defaults(
+    con: duckdb.DuckDBPyConnection, aws: FakeAws, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Read at bind, not at LOAD: a session sets them once instead of repeating
+    # workgroup= and output_location= on every scan.
+    monkeypatch.setenv("ATHENA_WORKGROUP", "etl")
+    monkeypatch.setenv("ATHENA_OUTPUT_LOCATION", "s3://elsewhere/prefix/")
+    con.execute(f"SELECT COUNT(*) FROM {SCAN}").fetchall()
+    con.execute(
+        f"SELECT COUNT(*) FROM athena_scan('orders', database='{DATABASE}', "
+        "workgroup='adhoc', output_location='s3://mine/')"
+    ).fetchall()
+    from_env, named = aws.requests("AmazonAthena.StartQueryExecution")
+    assert from_env["WorkGroup"] == "etl"
+    assert from_env["ResultConfiguration"] == {
+        "OutputLocation": "s3://elsewhere/prefix/"
+    }
+    assert named["WorkGroup"] == "adhoc"
+    assert named["ResultConfiguration"] == {"OutputLocation": "s3://mine/"}
