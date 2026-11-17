@@ -41,11 +41,20 @@ submission PR there.
    comparisons where DuckDB cast the column rather than the constant. Float
    and double are excluded on purpose; revisit only with accept (item 1).
 3. **Parallel scan** via local init and `max_threads`, once results arrive as
-   multiple objects (item 7).
+   multiple objects (item 8).
+
+4. **Progress freezes when the client thread runs the scan.** DuckDB
+   refreshes query progress from the client thread between tasks; when that
+   thread picks up the scan, it blocks in `exec` for the whole Athena wait
+   and the bar stays at its first reading. Always so with `SET threads = 1`,
+   and in 3 of 3 attempts on CI's macOS runner (2026-11-17), where the
+   progress test is a non-strict xfail; it moves on Linux CI and on a local
+   Mac. A fix needs a way to yield from `exec` without finishing, which C API
+   v2 does not expose yet.
 
 ## Both builds
 
-4. **Stop the Athena query when the DuckDB query is interrupted.** Confirmed
+5. **Stop the Athena query when the DuckDB query is interrupted.** Confirmed
    broken, against the fake and against real Athena (2026-11-16: `RUNNING` at
    interrupt, `SUCCEEDED` afterwards): neither C API tells a table function it was interrupted, so the
    poll loop runs until Athena finishes and the query bills in full (an
@@ -56,7 +65,7 @@ submission PR there.
    - Watch SIGINT inside the extension (`tokio::signal`) and stop the query.
      Works for the CLI; intrusive for a library, and blind to
      `connection.interrupt()` from Python or JDBC.
-5. **`SET athena_*` session options: not worth it yet.** Session defaults
+6. **`SET athena_*` session options: not worth it yet.** Session defaults
    ship as environment variables instead (`ATHENA_WORKGROUP`,
    `ATHENA_OUTPUT_LOCATION`; region and profile already have `AWS_REGION`
    and `AWS_PROFILE`), and CI stopped testing 1.4 (2026-11-17). Real `SET`
@@ -68,55 +77,55 @@ submission PR there.
    stable in the C API. DuckDB secrets cannot supply credentials on either
    path: the C API has no `duckdb_secret_*` functions, and `duckdb_secrets()`
    redacts the key.
-6. **`athena_query('SELECT ...')`.** Arbitrary SQL passthrough. The schema
+7. **`athena_query('SELECT ...')`.** Arbitrary SQL passthrough. The schema
     must be known at bind, so either run the query at bind and reuse the
     execution in init, or describe it via a prepared statement.
-7. **`UNLOAD` to Parquet instead of CSV.** `UNLOAD (SELECT ...) TO 's3://...'
+8. **`UNLOAD` to Parquet instead of CSV.** `UNLOAD (SELECT ...) TO 's3://...'
     WITH (format = 'PARQUET')` returns typed, columnar, multi-file results. It
     removes the CSV dialect parser, the text-to-type conversions and the JSON
     detour for nested types, and enables parallel reads. Needs a writable
     prefix, cleanup of the unloaded files, and a Parquet reader. Largest change
     here; measure against the current 1.07M rows in about 3s first.
-8. **Native `LIST`/`STRUCT`/`MAP`.** Currently JSON text via
+9. **Native `LIST`/`STRUCT`/`MAP`.** Currently JSON text via
     `CAST(col AS JSON)`. Going native on the CSV path needs a recursive Glue
-    type parser and nested vector writes in both adapters. Item 7 would make
+    type parser and nested vector writes in both adapters. Item 8 would make
     most of this unnecessary.
-9. **`catalog=` parameter** for cross-account Glue catalogs (`CatalogId`) and
+10. **`catalog=` parameter** for cross-account Glue catalogs (`CatalogId`) and
     Athena federated data catalogs.
-10. **Better cardinality.** The estimate is `maxrows`, else Glue's
+11. **Better cardinality.** The estimate is `maxrows`, else Glue's
     `recordCount`/`numRows`, and ignores `predicate=` and pushed filters. On
     partitioned tables, partition counts from Glue would tighten it.
 
 ## Build, CI and release
 
-11. **Dependency auditing.** Add `cargo deny` or `cargo audit` to CI. An
+12. **Dependency auditing.** Add `cargo deny` or `cargo audit` to CI. An
     earlier lockfile carried `zip` 6.0.0 via `libduckdb-sys` 1.10502.0, which
     had open RustSec advisories.
-12. **Declare an MSRV.** `libduckdb-sys` 1.20000.x needs Rust 1.88. Set
+13. **Declare an MSRV.** `libduckdb-sys` 1.20000.x needs Rust 1.88. Set
     `rust-version` in `Cargo.toml` after confirming the AWS SDK's own floor.
-13. **Platforms.** Enable `linux_arm64` first (Graviton), after building and
+14. **Platforms.** Enable `linux_arm64` first (Graviton), after building and
     load-testing it here. Leave `osx_amd64` excluded; DuckDB is phasing it out
     in 2.1.
-14. **Follow DuckDB patch releases.** Add each to the `load` matrix in
+15. **Follow DuckDB patch releases.** Add each to the `load` matrix in
     `ci.yml`. The v2 build moves only when `duckdb-neo` and `libduckdb-sys`
     publish for the new version; bump them with `V2_DUCKDB_VERSION` and the
     `api_version` in `src/v2.rs`.
 
 ## Testing
 
-15. **Fake AWS limits.** It now covers truncated result objects, an
+16. **Fake AWS limits.** It now covers truncated result objects, an
     unreadable result location, a refused `StopQueryExecution`, the result
     reuse request, and `profile=`/`region=` resolution (by the key and region
     each request is signed with). A truncated body is caught by the HTTP
     client before `results.rs`'s own `Content-Length` check, which stays
     untested end to end.
-16. **Live checks not yet scripted**: the managed-results paging fallback and
+17. **Live checks not yet scripted**: the managed-results paging fallback and
     the `DATE`/`TIMESTAMP`/`DECIMAL` round trip (both verified by hand on
     2026-08-30).
-17. **Live pushdown check for the v2 build**: assert `DataScannedInBytes`
+18. **Live pushdown check for the v2 build**: assert `DataScannedInBytes`
     drops on the partitioned fixture when a plain `WHERE` names the partition
     column. The fake cannot show pruning.
-18. **Check the fake against AWS Emulator**
+19. **Check the fake against AWS Emulator**
     ([aws/aws-emulator](https://github.com/aws/aws-emulator)), AWS's own local
     emulator, as a complement to `tests/e2e/fake_aws.py` rather than a
     replacement. The fake stays for what an emulator is unlikely to do on
@@ -137,11 +146,11 @@ submission PR there.
 
 ## Cleanup
 
-19. Work through `AUDIT.md`: `project/` duplicates `QUERIES.md` and
+20. Work through `AUDIT.md`: `project/` duplicates `QUERIES.md` and
     `live-check.sh`; README repeats `QUERIES.md`; the predicate preflight is a
     partial SQL lexer that could shrink to explicit safety checks.
-20. Drop the "Work in progress" banner from `README.md`, or say what is.
-21. Add a `ruff` config for `tests/` and `scripts/` so Python formatting is
+21. Drop the "Work in progress" banner from `README.md`, or say what is.
+22. Add a `ruff` config for `tests/` and `scripts/` so Python formatting is
     checked in CI rather than by hand.
 
 ## Assumptions, and what backs them
