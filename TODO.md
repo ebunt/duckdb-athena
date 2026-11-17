@@ -111,10 +111,12 @@ Live checks passed on 2026-11-16 against the same scan code, and
 
 ## Testing
 
-15. **Grow the fake AWS** (`tests/e2e/fake_aws.py`) where it is thin: short
-    reads and truncated result objects, an unreadable result location (the
-    paging fallback's other trigger), a refused `StopQueryExecution`, result
-    reuse, and `profile=`/`region=` resolution.
+15. **Fake AWS limits.** It now covers truncated result objects, an
+    unreadable result location, a refused `StopQueryExecution`, the result
+    reuse request, and `profile=`/`region=` resolution (by the key and region
+    each request is signed with). A truncated body is caught by the HTTP
+    client before `results.rs`'s own `Content-Length` check, which stays
+    untested end to end.
 16. **Live checks not yet scripted**: the managed-results paging fallback and
     the `DATE`/`TIMESTAMP`/`DECIMAL` round trip (both verified by hand on
     2026-08-30).
