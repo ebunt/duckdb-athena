@@ -33,7 +33,7 @@ repo:
   # carries both the MIT file `license:` claims and the current behaviour --
   # here, the one where a refused stop_query_execution is reported rather than
   # swallowed. Repin when anything user-visible lands on main.
-  ref: 91510d2393af313bcc873ddefb93c10ed8019c25
+  ref: 3025a22fd1ec405dd860f6d83d6b843abaf8d1d2
 
 docs:
   hello_world: |
