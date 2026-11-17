@@ -914,7 +914,7 @@ dependencies = [
 
 [[package]]
 name = "duckdb-athena"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "aws-config",
  "aws-sdk-athena",
