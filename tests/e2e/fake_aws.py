@@ -12,6 +12,8 @@ from __future__ import annotations
 import datetime as dt
 import decimal
 import json
+import re
+import sys
 import threading
 import time
 import uuid
@@ -71,6 +73,14 @@ def athena_csv(header: list[str], rows: list[list[str | None]]) -> bytes:
     return ("\n".join(lines) + "\n").encode()
 
 
+class _QuietServer(ThreadingHTTPServer):
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # A client dropping a cut-short result (truncate_result_after_rows) is
+        # the point of that test, not a server fault worth a traceback.
+        if not isinstance(sys.exc_info()[1], ConnectionResetError):
+            super().handle_error(request, client_address)
+
+
 class FakeAws:
     def __init__(self) -> None:
         self.fixture = duckdb.connect()
@@ -82,8 +92,18 @@ class FakeAws:
         # False makes executions expose no S3 location, as a workgroup with
         # Athena-managed results does; the extension must page instead.
         self.expose_result_location = True
+        # Status GetObject answers with instead of the result, e.g. 403 for a
+        # results bucket the caller cannot read; the extension must page.
+        self.result_object_status: int | None = None
+        # Serve only the result's first rows while promising the whole object
+        # in Content-Length, as a connection dropped mid-download does.
+        self.truncate_result_after_rows: int | None = None
+        # StopQueryExecution is denied, as it is without the IAM permission.
+        self.refuse_stop = False
+        # (operation, request body, signing region, access key) per call.
+        self.calls: list[tuple[str, dict[str, Any], str, str]] = []
         self._lock = threading.Lock()
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
+        self._server = _QuietServer(("127.0.0.1", 0), self._handler())
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
     @property
@@ -104,11 +124,23 @@ class FakeAws:
     def queries(self) -> list[str]:
         return [execution.query for execution in self.executions.values()]
 
+    def requests(self, operation: str) -> list[dict[str, Any]]:
+        return [request for name, request, *_ in self.calls if name == operation]
+
+    @property
+    def signers(self) -> set[tuple[str, str]]:
+        """(region, access key) of every signed call, S3 included."""
+        return {(region, key) for _, _, region, key in self.calls}
+
     def reset(self) -> None:
         self.executions.clear()
         self.stopped.clear()
+        self.calls.clear()
         self.run_seconds = 0.0
         self.expose_result_location = True
+        self.result_object_status = None
+        self.truncate_result_after_rows = None
+        self.refuse_stop = False
 
     # -- service operations -------------------------------------------------
 
@@ -188,6 +220,11 @@ class FakeAws:
         return 200, {"QueryExecution": body}
 
     def stop_query(self, request: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        if self.refuse_stop:
+            return 400, {
+                "__type": "AccessDeniedException",
+                "Message": "not authorized to perform: athena:StopQueryExecution",
+            }
         execution_id = request["QueryExecutionId"]
         self.executions[execution_id].cancelled = True
         self.stopped.append(execution_id)
@@ -211,11 +248,23 @@ class FakeAws:
         return 200, body
 
     def get_object(self, path: str) -> tuple[int, bytes]:
+        if self.result_object_status is not None:
+            return (
+                self.result_object_status,
+                b"<Error><Code>AccessDenied</Code></Error>",
+            )
         bucket, _, key = path.lstrip("/").partition("/")
         execution = self.executions.get(key.removesuffix(".csv"))
         if bucket != RESULT_BUCKET or execution is None or execution.csv is None:
             return 404, b"<Error><Code>NoSuchKey</Code></Error>"
         return 200, execution.csv
+
+    def _record(self, operation: str, request: dict[str, Any], auth: str) -> None:
+        # SigV4: "Credential=<key>/<date>/<region>/<service>/aws4_request".
+        match = re.search(r"Credential=([^/]+)/[^/]+/([^/]+)/", auth)
+        key, region = match.groups() if match else ("", "")
+        with self._lock:
+            self.calls.append((operation, request, region, key))
 
     # -- http ---------------------------------------------------------------
 
@@ -245,7 +294,9 @@ class FakeAws:
             def do_POST(self) -> None:
                 length = int(self.headers.get("Content-Length", 0))
                 request = json.loads(self.rfile.read(length) or b"{}")
-                operation = operations.get(self.headers.get("X-Amz-Target", ""))
+                target = self.headers.get("X-Amz-Target", "")
+                fake._record(target, request, self.headers.get("Authorization", ""))
+                operation = operations.get(target)
                 if operation is None:
                     status, payload = 400, {"__type": "UnknownOperationException"}
                 else:
@@ -255,7 +306,25 @@ class FakeAws:
                 )
 
             def do_GET(self) -> None:
-                status, body = fake.get_object(self.path.partition("?")[0])
+                path = self.path.partition("?")[0]
+                fake._record(
+                    "S3.GetObject",
+                    {"Path": path},
+                    self.headers.get("Authorization", ""),
+                )
+                status, body = fake.get_object(path)
+                cut = fake.truncate_result_after_rows
+                if status == 200 and cut is not None:
+                    # Header plus `cut` rows, ending on a row boundary: the case
+                    # that parses cleanly and would pass for a short result.
+                    lines = body.split(b"\n")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(b"\n".join(lines[: cut + 1]) + b"\n")
+                    self.close_connection = True
+                    return
                 self._send(
                     status,
                     body,

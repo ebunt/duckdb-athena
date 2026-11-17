@@ -143,3 +143,111 @@ def test_interrupt_stops_the_athena_query(
     with pytest.raises(duckdb.Error, match="Interrupted"):
         con.execute(f"SELECT COUNT(*) FROM {SCAN}").fetchall()
     assert len(aws.stopped) == 1
+
+
+def test_unreadable_result_object_falls_back_to_paging(
+    con: duckdb.DuckDBPyConnection, aws: FakeAws
+) -> None:
+    # A results bucket the caller may not read (403) must not fail the scan:
+    # the same rows are still reachable through GetQueryResults.
+    aws.result_object_status = 403
+    got = con.execute(f"SELECT * FROM {SCAN} ORDER BY id").fetchall()
+    assert got == truth(aws, f"{TRUTH} ORDER BY id")
+    assert aws.requests("AmazonAthena.GetQueryResults")
+
+
+def test_truncated_result_object_fails_rather_than_returning_a_prefix(
+    con: duckdb.DuckDBPyConnection, aws: FakeAws
+) -> None:
+    # Cut on a row boundary, so the CSV parses cleanly: only the byte count
+    # against Content-Length can tell 3 rows from 5000. Today the HTTP client
+    # rejects the short body before results.rs's own check runs; either way
+    # the scan must fail rather than answer 3.
+    aws.truncate_result_after_rows = 3
+    with pytest.raises(duckdb.Error, match="Athena result"):
+        con.execute(f"SELECT COUNT(id) FROM {SCAN}").fetchall()
+
+
+def test_refused_stop_is_reported_not_swallowed(
+    con: duckdb.DuckDBPyConnection, aws: FakeAws
+) -> None:
+    # The user must learn the query may still be running and billing, and how
+    # to stop it themselves.
+    aws.run_seconds = 30
+    aws.refuse_stop = True
+    scan = f"athena_scan('orders', database='{DATABASE}', timeout_seconds=1)"
+    with pytest.raises(duckdb.Error) as raised:
+        con.execute(f"SELECT COUNT(*) FROM {scan}").fetchall()
+    message = str(raised.value)
+    assert "Stopping it failed" in message
+    assert "aws athena stop-query-execution" in message
+    assert "--region us-east-1" in message
+    assert aws.requests("AmazonAthena.StopQueryExecution")
+    assert aws.stopped == []
+
+
+def test_result_reuse_reaches_athena(
+    con: duckdb.DuckDBPyConnection, aws: FakeAws
+) -> None:
+    scan = f"athena_scan('orders', database='{DATABASE}', result_reuse_minutes=90)"
+    con.execute(f"SELECT COUNT(*) FROM {scan}").fetchall()
+    con.execute(f"SELECT COUNT(*) FROM {SCAN}").fetchall()
+    with_reuse, without = aws.requests("AmazonAthena.StartQueryExecution")
+    assert with_reuse["ResultReuseConfiguration"] == {
+        "ResultReuseByAgeConfiguration": {"Enabled": True, "MaxAgeInMinutes": 90}
+    }
+    assert "ResultReuseConfiguration" not in without
+
+
+@pytest.fixture
+def profile_config(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An ~/.aws/config with one profile whose key and region differ from the
+    environment's, so every signed request shows which one was used."""
+    config = tmp_path / "config"
+    config.write_text(
+        "[profile other]\n"
+        "aws_access_key_id = profile-key\n"
+        "aws_secret_access_key = profile-secret\n"
+        "region = ap-southeast-2\n"
+    )
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(config))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "absent"))
+
+
+def test_region_parameter_signs_every_call_for_that_region(
+    con: duckdb.DuckDBPyConnection, aws: FakeAws
+) -> None:
+    scan = f"athena_scan('orders', database='{DATABASE}', region='eu-west-1')"
+    con.execute(f"SELECT COUNT(*) FROM {scan}").fetchall()
+    assert aws.signers == {("eu-west-1", "fake")}
+
+
+@pytest.mark.usefixtures("profile_config")
+def test_profile_beats_environment_credentials(
+    con: duckdb.DuckDBPyConnection, aws: FakeAws
+) -> None:
+    # AWS_ACCESS_KEY_ID is set (conftest). The default chain reads it before
+    # any profile, which once made profile= a silent no-op: the scan ran as
+    # the environment's identity, possibly in another account.
+    scan = f"athena_scan('orders', database='{DATABASE}', profile='other')"
+    con.execute(f"SELECT COUNT(*) FROM {scan}").fetchall()
+    assert aws.signers == {("ap-southeast-2", "profile-key")}
+
+
+@pytest.mark.usefixtures("profile_config")
+def test_region_parameter_beats_the_profiles_region(
+    con: duckdb.DuckDBPyConnection, aws: FakeAws
+) -> None:
+    scan = (
+        f"athena_scan('orders', database='{DATABASE}', profile='other', "
+        "region='eu-west-1')"
+    )
+    con.execute(f"SELECT COUNT(*) FROM {scan}").fetchall()
+    assert aws.signers == {("eu-west-1", "profile-key")}
+
+
+@pytest.mark.usefixtures("profile_config")
+def test_unknown_profile_is_named(con: duckdb.DuckDBPyConnection) -> None:
+    scan = f"athena_scan('orders', database='{DATABASE}', profile='nope')"
+    with pytest.raises(duckdb.Error, match="profile `nope` was not defined"):
+        con.execute(f"SELECT COUNT(*) FROM {scan}").fetchall()
