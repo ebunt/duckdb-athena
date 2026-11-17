@@ -8,7 +8,7 @@
 extension:
   name: athena
   description: Query AWS Athena tables from DuckDB
-  version: 0.4.1
+  version: 0.4.2
   language: Rust
   build: cargo
   license: MIT
@@ -33,7 +33,7 @@ repo:
   # carries both the MIT file `license:` claims and the current behaviour --
   # here, the one where a refused stop_query_execution is reported rather than
   # swallowed. Repin when anything user-visible lands on main.
-  ref: 5d9e225df0e3b5877b24138cdbbdcbaa95442023
+  ref: 91510d2393af313bcc873ddefb93c10ed8019c25
 
 docs:
   hello_world: |
