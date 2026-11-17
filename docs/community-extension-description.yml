@@ -8,7 +8,7 @@
 extension:
   name: athena
   description: Query AWS Athena tables from DuckDB
-  version: 0.4.2
+  version: 0.4.3
   language: Rust
   build: cargo
   license: MIT
@@ -68,7 +68,9 @@ docs:
 
     Named parameters: `database`, `maxrows`, `predicate`, `workgroup`,
     `output_location`, `region`, `profile`, `timeout_seconds`,
-    `result_reuse_minutes`.
+    `result_reuse_minutes`. `ATHENA_WORKGROUP` and `ATHENA_OUTPUT_LOCATION`
+    set session defaults for the two that are otherwise repeated on every
+    scan; region and profile follow `AWS_REGION` and `AWS_PROFILE`.
 
     Required IAM: `athena:StartQueryExecution`, `athena:GetQueryExecution`,
     `athena:GetQueryResults`, `athena:StopQueryExecution`, `glue:GetTable`, and

@@ -20,13 +20,14 @@ Last reviewed 2026-11-14 against DuckDB 2.0.0 (2.0.1 is due 2026-11-18).
 Each release publishes both: the v1 build for DuckDB 1.4 through 2.0, and the
 v2 build for DuckDB v2.0.0 only. community-extensions builds v1 only.
 
-## Submitting 0.4.2
+## Submitting 0.4.3
 
-0.4.2 is tagged on `91510d2` and published on GitHub (2026-11-16); 0.4.1 was
-tagged but never published. `docs/community-extension-description.yml` is
-pinned to `91510d2`. community-extensions builds with `extension-ci-tools`
-`v2.0-cyanoptera` (its `build.yml`, checked 2026-11-16), the branch this
-repo's submodule tracks. What remains is the submission PR there.
+0.4.3 adds the `ATHENA_WORKGROUP`/`ATHENA_OUTPUT_LOCATION` session defaults
+to 0.4.2. Tag `v0.4.3` on the merge commit of this change, let `release.yml`
+publish it, then repin `docs/community-extension-description.yml` (still
+naming 0.4.2's `91510d2`) to that commit and open the submission PR there.
+community-extensions builds with `extension-ci-tools` `v2.0-cyanoptera` (its
+`build.yml`, checked 2026-11-16), the branch this repo's submodule tracks.
 
 ## C API v2 track
 
