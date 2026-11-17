@@ -116,14 +116,32 @@ repo's submodule tracks. What remains is the submission PR there.
 17. **Live pushdown check for the v2 build**: assert `DataScannedInBytes`
     drops on the partitioned fixture when a plain `WHERE` names the partition
     column. The fake cannot show pruning.
+18. **Check the fake against AWS Emulator**
+    ([aws/aws-emulator](https://github.com/aws/aws-emulator)), AWS's own local
+    emulator, as a complement to `tests/e2e/fake_aws.py` rather than a
+    replacement. The fake stays for what an emulator is unlikely to do on
+    demand: a slow query, a 403 or truncated result object, a refused stop,
+    and asserting on the SQL and signing region each request carried. What the
+    emulator could add is response shapes AWS maintains: run a few scans
+    against it and diff its Glue `GetTable` (partition keys, `Parameters`),
+    `GetQueryExecution` and S3 `GetObject` against what the fake returns.
+    To settle first (checked 2026-11-16 from its repo):
+    - **SQL dialect.** Its Athena runs SQLite, not Trino; `CAST(col AS JSON)`
+      and `DECIMAL '...'` literals likely fail, so keep those scans simple.
+    - **Connecting.** Server mode is HTTPS on `127.0.0.1:9297` with a
+      self-signed certificate the extension's Rust SDK must trust. Embedded
+      mode is Rust-only.
+    - **CI.** Linux packages exist; macOS needs a container or a source build.
+    - **Coverage.** Its published fidelity scores and `issues/` for Athena,
+      Glue `GetTable` and S3 `GetObject`.
 
 ## Cleanup
 
-18. Work through `AUDIT.md`: `project/` duplicates `QUERIES.md` and
+19. Work through `AUDIT.md`: `project/` duplicates `QUERIES.md` and
     `live-check.sh`; README repeats `QUERIES.md`; the predicate preflight is a
     partial SQL lexer that could shrink to explicit safety checks.
-19. Drop the "Work in progress" banner from `README.md`, or say what is.
-20. Add a `ruff` config for `tests/` and `scripts/` so Python formatting is
+20. Drop the "Work in progress" banner from `README.md`, or say what is.
+21. Add a `ruff` config for `tests/` and `scripts/` so Python formatting is
     checked in CI rather than by hand.
 
 ## Assumptions, and what backs them
